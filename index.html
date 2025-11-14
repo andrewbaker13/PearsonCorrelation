@@ -131,14 +131,38 @@
             </div>
         </section>
 
+        <section class="card advanced-card">
+            <details class="advanced-details">
+                <summary>Advanced analysis settings</summary>
+                <p class="advanced-lede">By default we report Pearson&rsquo;s r for linear, jointly normal relationships. Switch to Spearman&rsquo;s rho for a rank-based estimate that down-weights outliers and handles ordinal or monotonic trends.</p>
+                <div class="method-options" role="group" aria-label="Select correlation estimator">
+                    <label class="method-option" for="method-pearson">
+                        <input type="radio" name="correlation-method" id="method-pearson" value="pearson" checked>
+                        <div>
+                            <span class="method-title">Pearson product-moment</span>
+                            <p class="method-note">Tracks linear association and matches the equations above. Works best when both metrics are roughly normal and measured on interval scales.</p>
+                        </div>
+                    </label>
+                    <label class="method-option" for="method-spearman">
+                        <input type="radio" name="correlation-method" id="method-spearman" value="spearman">
+                        <div>
+                            <span class="method-title">Spearman rank correlation</span>
+                            <p class="method-note">Ranks each metric before correlating, surfacing monotonic or ordinal relationships while reducing the influence of extreme points.</p>
+                        </div>
+                    </label>
+                </div>
+                <p class="method-reminder">This selection drives every card, chart, narrative, and diagnostic once data are provided.</p>
+            </details>
+        </section>
+
         <section id="analysis-status" class="card">
             <h2>Analysis Status</h2>
-            <p id="status-message">Enter data to compute the Pearson correlation.</p>
+            <p id="status-message">Enter data to compute the selected correlation.</p>
         </section>
 
         <section class="results-grid single-only">
             <article class="result-card" id="test-result-card">
-                <h3>Pearson correlation</h3>
+                <h3 id="correlation-heading">Pearson correlation</h3>
                 <p id="test-statistic">r = --</p>
                 <p id="p-value">p = --</p>
                 <p id="ci-summary">95% CI: [--, --]</p>
@@ -198,7 +222,7 @@
             <details class="diagnostics-details">
                 <summary>Assumption checks</summary>
                 <div id="diagnostics-content">
-                    <p>The Pearson correlation assumes paired observations come from jointly normal distributions, that the relationship is roughly linear, and that each pair is independent. We will summarize diagnostics here after you provide data.</p>
+                    <p>After you run an analysis, this panel summarizes sample size, variance, skew, outliers, and whether Pearson or Spearman best fits the relationship.</p>
                 </div>
             </details>
         </section>

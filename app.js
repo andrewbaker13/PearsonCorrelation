@@ -7,6 +7,11 @@ const InputModes = Object.freeze({
     MATRIX: 'matrix'
 });
 
+const CorrelationMethods = Object.freeze({
+    PEARSON: 'pearson',
+    SPEARMAN: 'spearman'
+});
+
 const MODE_LABELS = {
     [InputModes.MANUAL]: 'Manual entry',
     [InputModes.PAIRED]: 'Paired upload',
@@ -27,6 +32,7 @@ let uploadedPairedData = null;
 let uploadedMatrixData = null;
 let scatterPairs = [];
 let activeScatterPair = null;
+let selectedCorrelationMethod = CorrelationMethods.PEARSON;
 
 // Utility helpers
 function clamp(value, min, max) {
@@ -57,6 +63,47 @@ function standardDeviation(values) {
     const m = mean(values);
     const variance = values.reduce((sum, v) => sum + Math.pow(v - m, 2), 0) / (values.length - 1);
     return Math.sqrt(variance);
+}
+
+function computeSkewness(values) {
+    if (!Array.isArray(values) || values.length < 3) return NaN;
+    const m = mean(values);
+    const sd = standardDeviation(values);
+    if (!sd || !isFinite(sd)) return NaN;
+    const n = values.length;
+    const adjusted = values.reduce((sum, value) => sum + Math.pow((value - m) / sd, 3), 0);
+    return (n / ((n - 1) * (n - 2))) * adjusted;
+}
+
+function rankValues(values = []) {
+    const entries = values.map((value, index) => ({ value, index }));
+    entries.sort((a, b) => a.value - b.value);
+    const ranks = new Array(values.length);
+    let i = 0;
+    while (i < entries.length) {
+        let j = i + 1;
+        while (j < entries.length && entries[j].value === entries[i].value) {
+            j++;
+        }
+        const avgRank = (i + j - 1) / 2 + 1;
+        for (let k = i; k < j; k++) {
+            ranks[entries[k].index] = avgRank;
+        }
+        i = j;
+    }
+    return ranks;
+}
+
+function describeCorrelationMethod(method = selectedCorrelationMethod, { short = false } = {}) {
+    const target = method || CorrelationMethods.PEARSON;
+    if (short) {
+        return target === CorrelationMethods.SPEARMAN ? 'Spearman' : 'Pearson';
+    }
+    return target === CorrelationMethods.SPEARMAN ? 'Spearman rank correlation' : 'Pearson correlation';
+}
+
+function getCoefficientSymbol(method = selectedCorrelationMethod) {
+    return method === CorrelationMethods.SPEARMAN ? 'rho' : 'r';
 }
 
 function erf(x) {
@@ -277,6 +324,17 @@ function calculateCorrelationCoefficient(xValues, yValues) {
     return numerator / ((n - 1) * denominator);
 }
 
+function calculateSpearmanCoefficient(xValues, yValues) {
+    if (!Array.isArray(xValues) || !Array.isArray(yValues)) return NaN;
+    const n = Math.min(xValues.length, yValues.length);
+    if (!Number.isInteger(n) || n < 3) return NaN;
+    const trimmedX = xValues.slice(0, n);
+    const trimmedY = yValues.slice(0, n);
+    const rankedX = rankValues(trimmedX);
+    const rankedY = rankValues(trimmedY);
+    return calculateCorrelationCoefficient(rankedX, rankedY);
+}
+
 function getScatterSelect() {
     return document.getElementById('scatterpair-select');
 }
@@ -484,7 +542,7 @@ function gatherInput() {
     return { valid: false, message: 'Unsupported mode.' };
 }
 
-function computeCorrelationStats(data) {
+function computeCorrelationStats(data, { method = CorrelationMethods.PEARSON } = {}) {
     const alpha = clamp(data.alpha, 1e-6, 0.5);
     const xValues = data.xValues || [];
     const yValues = data.yValues || [];
@@ -492,20 +550,21 @@ function computeCorrelationStats(data) {
     if (!Number.isInteger(n) || n < 3) {
         return null;
     }
-    const meanX = mean(xValues);
-    const meanY = mean(yValues);
-    const sdX = standardDeviation(xValues);
-    const sdY = standardDeviation(yValues);
-    const denominator = sdX * sdY;
-    if (!denominator || !isFinite(denominator)) {
+    const trimmedX = xValues.slice(0, n);
+    const trimmedY = yValues.slice(0, n);
+    const meanX = mean(trimmedX);
+    const meanY = mean(trimmedY);
+    const sdX = standardDeviation(trimmedX);
+    const sdY = standardDeviation(trimmedY);
+    if (!sdX || !sdY || !isFinite(sdX) || !isFinite(sdY)) {
         return null;
     }
-    const numerator = xValues.reduce((sum, value, index) => {
-        const centeredX = value - meanX;
-        const centeredY = yValues[index] - meanY;
-        return sum + centeredX * centeredY;
-    }, 0);
-    const r = numerator / ((n - 1) * denominator);
+    const analysisX = method === CorrelationMethods.SPEARMAN ? rankValues(trimmedX) : trimmedX;
+    const analysisY = method === CorrelationMethods.SPEARMAN ? rankValues(trimmedY) : trimmedY;
+    const r = calculateCorrelationCoefficient(analysisX, analysisY);
+    if (!isFinite(r)) {
+        return null;
+    }
     const df = n - 2;
     const rSquared = r * r;
     const tStatistic = Math.sqrt((df) * rSquared / Math.max(1 - rSquared, 1e-12)) * Math.sign(r);
@@ -541,12 +600,15 @@ function computeCorrelationStats(data) {
         sdX,
         sdY,
         standardErrorZ,
+        method,
+        pearsonR: calculateCorrelationCoefficient(trimmedX, trimmedY),
+        spearmanR: calculateSpearmanCoefficient(trimmedX, trimmedY),
         xLabel: data.labels?.x || 'Variable X',
         yLabel: data.labels?.y || 'Variable Y'
     };
 }
 
-function computeMatrixCorrelations(data) {
+function computeMatrixCorrelations(data, { method = CorrelationMethods.PEARSON } = {}) {
     if (!data || !data.matrix) return null;
     const alpha = clamp(data.alpha, 1e-6, 0.5);
     const matrix = data.matrix;
@@ -557,10 +619,12 @@ function computeMatrixCorrelations(data) {
     if (!Number.isInteger(n) || n < 3) return null;
     const means = {};
     const sds = {};
+    const workingColumns = {};
     variables.forEach(name => {
-        const values = columns[name] || [];
+        const values = (columns[name] || []).slice(0, n);
         means[name] = mean(values);
         sds[name] = standardDeviation(values);
+        workingColumns[name] = method === CorrelationMethods.SPEARMAN ? rankValues(values) : values;
     });
     const correlations = variables.map(() => Array(variables.length).fill(NaN));
     const pairStats = [];
@@ -569,8 +633,8 @@ function computeMatrixCorrelations(data) {
     for (let i = 0; i < variables.length; i++) {
         correlations[i][i] = 1;
         for (let j = i + 1; j < variables.length; j++) {
-            const valuesA = columns[variables[i]];
-            const valuesB = columns[variables[j]];
+            const valuesA = workingColumns[variables[i]];
+            const valuesB = workingColumns[variables[j]];
             const r = calculateCorrelationCoefficient(valuesA, valuesB);
             correlations[j][i] = r;
             correlations[i][j] = r;
@@ -607,24 +671,41 @@ function computeMatrixCorrelations(data) {
         sds,
         correlations,
         columns,
-        pairStats
+        pairStats,
+        method
     };
 }
 
 function buildMatrixScatterPairs(stats) {
     if (!stats || !Array.isArray(stats.variables)) return [];
     const pairs = [];
+    const pairStatMap = new Map();
+    if (Array.isArray(stats.pairStats)) {
+        stats.pairStats.forEach(pair => {
+            const forwardKey = `${pair.xName}__${pair.yName}`;
+            const reverseKey = `${pair.yName}__${pair.xName}`;
+            pairStatMap.set(forwardKey, pair);
+            pairStatMap.set(reverseKey, { ...pair, xName: pair.yName, yName: pair.xName });
+        });
+    }
     for (let i = 0; i < stats.variables.length; i++) {
         for (let j = i + 1; j < stats.variables.length; j++) {
             const xName = stats.variables[i];
             const yName = stats.variables[j];
             const xValues = stats.columns[xName] || [];
             const yValues = stats.columns[yName] || [];
+            const pairKey = `${xName}__${yName}`;
             pairs.push({
                 id: `${xName}__${yName}`,
                 label: `${yName} vs ${xName}`,
                 x: { name: xName, values: xValues },
-                y: { name: yName, values: yValues }
+                y: { name: yName, values: yValues },
+                meta: {
+                    alpha: stats.alpha,
+                    method: stats.method,
+                    n: stats.n,
+                    pairStats: pairStatMap.get(pairKey) || null
+                }
             });
         }
     }
@@ -653,13 +734,20 @@ function updateResultCards(stats, data) {
     const meanDiff = document.getElementById('mean-diff');
     const sampleSummary = document.getElementById('sample-summary');
     const modeSummary = document.getElementById('mode-summary');
+    const heading = document.getElementById('correlation-heading');
+    const method = stats?.method || selectedCorrelationMethod;
+    const methodLabel = describeCorrelationMethod(method);
+    const coefficientSymbol = getCoefficientSymbol(method);
+    if (heading) {
+        heading.textContent = methodLabel;
+    }
 
     if (!stats) {
-        testStat.textContent = 'r = --';
+        testStat.textContent = `${coefficientSymbol} = --`;
         pValue.textContent = 'p = --';
         ciSummary.textContent = 'CI: [--, --]';
         effectSize.textContent = 't(--)=--';
-        hedges.textContent = 'R² = --';
+        hedges.textContent = 'R^2 = --';
         meanDiff.textContent = 'Means: --';
         if (data && data.mode === InputModes.MATRIX && data.matrix && Number.isInteger(data.matrix.rowCount)) {
             sampleSummary.textContent = `n = ${data.matrix.rowCount} rows`;
@@ -670,13 +758,15 @@ function updateResultCards(stats, data) {
         return;
     }
 
-    testStat.textContent = `r = ${formatNumber(stats.r, 3)}`;
+    testStat.textContent = `${coefficientSymbol} = ${formatNumber(stats.r, 3)}`;
     pValue.textContent = formatPValue(stats.pValue);
     ciSummary.textContent = `${Math.round((1 - stats.alpha) * 100)}% CI: [${formatNumber(stats.ciLower)}, ${formatNumber(stats.ciUpper)}]`;
     effectSize.textContent = `t(${stats.df}) = ${formatNumber(stats.tStatistic, 3)}`;
-    hedges.textContent = `R² = ${formatNumber(stats.rSquared, 3)}`;
+    hedges.textContent = `R^2 = ${formatNumber(stats.rSquared, 3)}`;
     if (isFinite(stats.meanX) && isFinite(stats.meanY)) {
-        meanDiff.textContent = `Means: x̄ = ${formatNumber(stats.meanX)}, ȳ = ${formatNumber(stats.meanY)}`;
+        const xLabel = stats.xLabel || 'Variable X';
+        const yLabel = stats.yLabel || 'Variable Y';
+        meanDiff.textContent = `Means: ${xLabel} = ${formatNumber(stats.meanX)}, ${yLabel} = ${formatNumber(stats.meanY)}`;
     } else {
         meanDiff.textContent = 'Means: --';
     }
@@ -696,6 +786,9 @@ function renderMeanDifferenceChart(stats) {
         }
         return;
     }
+    const method = stats.method || selectedCorrelationMethod;
+    const coefficientSymbol = getCoefficientSymbol(method);
+    const axisLabel = method === CorrelationMethods.SPEARMAN ? 'Rank correlation (rho)' : 'Correlation (r)';
     if (Array.isArray(stats.pairStats)) {
         const pairs = stats.pairStats;
         if (!pairs.length) {
@@ -727,14 +820,14 @@ function renderMeanDifferenceChart(stats) {
                 color: '#1f2a37',
                 thickness: 1.5
             },
-            hovertemplate: 'r = %{x:.3f}<br>%{y}<extra></extra>'
+            hovertemplate: `${coefficientSymbol} = %{x:.3f}<br>%{y}<extra></extra>`
         };
         const layout = {
             margin: { l: 120, r: 40, t: 30, b: 50 },
             xaxis: {
                 zeroline: true,
                 zerolinecolor: '#c6d0e0',
-                title: 'Correlation (r)',
+                title: axisLabel,
                 range: [-1, 1],
                 gridcolor: '#eef2fb'
             },
@@ -757,8 +850,8 @@ function renderMeanDifferenceChart(stats) {
     }
     const hasCI = isFinite(stats.ciLower) && isFinite(stats.ciUpper);
     const hoverTemplate = hasCI
-        ? `r = ${formatNumber(stats.r, 3)}<br>${Math.round((1 - stats.alpha) * 100)}% CI: [${formatNumber(stats.ciLower)}, ${formatNumber(stats.ciUpper)}]<extra></extra>`
-        : `r = ${formatNumber(stats.r, 3)}<br>CI requires at least 4 pairs.<extra></extra>`;
+        ? `${coefficientSymbol} = ${formatNumber(stats.r, 3)}<br>${Math.round((1 - stats.alpha) * 100)}% CI: [${formatNumber(stats.ciLower)}, ${formatNumber(stats.ciUpper)}]<extra></extra>`
+        : `${coefficientSymbol} = ${formatNumber(stats.r, 3)}<br>CI requires at least 4 pairs.<extra></extra>`;
     const trace = {
         x: [stats.r],
         y: ['Correlation'],
@@ -786,7 +879,7 @@ function renderMeanDifferenceChart(stats) {
         xaxis: {
             zeroline: true,
             zerolinecolor: '#c6d0e0',
-            title: 'Correlation (r)',
+            title: axisLabel,
             range: [-1, 1],
             gridcolor: '#eef2fb'
         },
@@ -813,7 +906,7 @@ function renderMeanDifferenceChart(stats) {
     if (note) {
         if (hasCI) {
             const ciLabel = `${Math.round((1 - stats.alpha) * 100)}% CI`;
-            note.textContent = `r = ${formatNumber(stats.r, 3)}; ${ciLabel}: [${formatNumber(stats.ciLower)}, ${formatNumber(stats.ciUpper)}]`;
+            note.textContent = `${coefficientSymbol} = ${formatNumber(stats.r, 3)}; ${ciLabel}: [${formatNumber(stats.ciLower)}, ${formatNumber(stats.ciUpper)}]`;
         } else {
             note.textContent = 'Need at least 4 paired observations to compute the Fisher z confidence interval.';
         }
@@ -859,6 +952,60 @@ function renderScatterPlot(pair) {
         hovertemplate: `${pair.x.name} = %{x:.3f}<br>${pair.y.name} = %{y:.3f}<extra></extra>`
     };
     const traces = [pointTrace];
+    let ciBandTrace = null;
+    let ciLabelText = '';
+    if (slopeIntercept && selectedCorrelationMethod === CorrelationMethods.PEARSON) {
+        const n = Math.min(xValues.length, yValues.length);
+        const meanX = mean(xValues);
+        const sxx = xValues.reduce((sum, value) => sum + Math.pow(value - meanX, 2), 0);
+        const residualSS = xValues.reduce((sum, value, index) => {
+            const predicted = slopeIntercept.intercept + slopeIntercept.slope * value;
+            const residual = yValues[index] - predicted;
+            return sum + residual * residual;
+        }, 0);
+        const df = n - 2;
+        const alpha = typeof pair.meta?.alpha === 'number' ? pair.meta.alpha : (1 - selectedConfidenceLevel);
+        const ciLevel = 1 - alpha;
+        if (df > 0 && sxx > 0 && residualSS > 0) {
+            const residualStd = Math.sqrt(residualSS / df);
+            const tCrit = tCritical(1 - alpha / 2, df);
+            if (isFinite(residualStd) && isFinite(tCrit)) {
+                const minX = Math.min(...xValues);
+                const maxX = Math.max(...xValues);
+                if (isFinite(minX) && isFinite(maxX) && maxX > minX) {
+                    const points = Math.min(Math.max(n, 20), 80);
+                    const gridX = Array.from({ length: points }, (_, idx) => {
+                        const fraction = idx / (points - 1);
+                        return minX + fraction * (maxX - minX);
+                    });
+                    const upper = [];
+                    const lower = [];
+                    gridX.forEach(value => {
+                        const predicted = slopeIntercept.intercept + slopeIntercept.slope * value;
+                        const meanSE = residualStd * Math.sqrt((1 / n) + Math.pow(value - meanX, 2) / sxx);
+                        const delta = tCrit * meanSE;
+                        upper.push(predicted + delta);
+                        lower.push(predicted - delta);
+                    });
+                    ciBandTrace = {
+                        x: [...gridX, ...gridX.slice().reverse()],
+                        y: [...upper, ...lower.slice().reverse()],
+                        mode: 'lines',
+                        type: 'scatter',
+                        fill: 'toself',
+                        fillcolor: 'rgba(42, 125, 225, 0.12)',
+                        line: { color: 'rgba(42, 125, 225, 0)' },
+                        hoverinfo: 'skip',
+                        showlegend: false
+                    };
+                    ciLabelText = `${Math.round(ciLevel * 100)}% confidence band`;
+                }
+            }
+        }
+    }
+    if (ciBandTrace) {
+        traces.unshift(ciBandTrace);
+    }
     if (slopeIntercept) {
         const sortedX = [...xValues].sort((a, b) => a - b);
         const minX = sortedX[0];
@@ -892,8 +1039,19 @@ function renderScatterPlot(pair) {
     };
 
     Plotly.react(container, traces, layout, { responsive: true, displayModeBar: false });
-    const rText = slopeIntercept && isFinite(slopeIntercept.r) ? ` (r = ${formatNumber(slopeIntercept.r, 3)})` : '';
-    note.textContent = `Points show paired observations for ${pair.y.name} vs ${pair.x.name}; line depicts the least-squares fit${rText}.`;
+    const methodLabelShort = describeCorrelationMethod(selectedCorrelationMethod, { short: true });
+    const coefficientSymbol = getCoefficientSymbol(selectedCorrelationMethod);
+    const correlationValue = selectedCorrelationMethod === CorrelationMethods.SPEARMAN
+        ? calculateSpearmanCoefficient(xValues, yValues)
+        : slopeIntercept && isFinite(slopeIntercept.r)
+            ? slopeIntercept.r
+            : calculateCorrelationCoefficient(xValues, yValues);
+    const lineNote = slopeIntercept ? '; line depicts the least-squares fit' : '';
+    const methodNote = isFinite(correlationValue)
+        ? `; ${methodLabelShort} estimate (${coefficientSymbol} = ${formatNumber(correlationValue, 3)})`
+        : '';
+    const bandNote = ciLabelText ? `; ${ciLabelText} shown only for Pearson mode` : '';
+    note.textContent = `Points show paired observations for ${pair.y.name} vs ${pair.x.name}${lineNote}${methodNote}${bandNote}.`;
 }
 
 function renderCorrelationHeatmap(stats) {
@@ -907,6 +1065,8 @@ function renderCorrelationHeatmap(stats) {
         }
         return;
     }
+    const method = stats.method || selectedCorrelationMethod;
+    const coefficientSymbol = getCoefficientSymbol(method);
     const variables = stats.variables;
     const pairMap = new Map();
     if (Array.isArray(stats.pairStats)) {
@@ -915,22 +1075,23 @@ function renderCorrelationHeatmap(stats) {
             pairMap.set(`${pair.yName}__${pair.xName}`, pair);
         });
     }
-    const z = variables.map((_, row) => variables.map((_, col) => (row >= col ? stats.correlations[row][col] : null)));
+    const z = variables.map((_, row) => variables.map((_, col) => (row > col ? stats.correlations[row][col] : null)));
     const text = variables.map((_, row) => variables.map((_, col) => {
-        if (row === col) return '1.000';
-        if (row > col) return formatNumber(stats.correlations[row][col], 3);
+        if (row > col) {
+            return formatNumber(stats.correlations[row][col], 2);
+        }
         return '';
     }));
     const hoverTexts = variables.map((yName, row) => variables.map((xName, col) => {
-        if (row < col) return '';
+        if (row <= col) return '';
         const pair = pairMap.get(`${xName}__${yName}`);
         if (!pair) {
-            return `${yName} vs ${xName}<br>r = ${formatNumber(stats.correlations[row][col], 3)}<br>CI unavailable`;
+            return `${yName} vs ${xName}<br>${coefficientSymbol} = ${formatNumber(stats.correlations[row][col], 3)}<br>CI unavailable`;
         }
         const ciText = (isFinite(pair.ciLower) && isFinite(pair.ciUpper))
             ? `${Math.round((1 - stats.alpha) * 100)}% CI: [${formatNumber(pair.ciLower)}, ${formatNumber(pair.ciUpper)}]`
             : 'CI unavailable';
-        return `${yName} vs ${xName}<br>r = ${formatNumber(pair.r, 3)}<br>${ciText}`;
+        return `${yName} vs ${xName}<br>${coefficientSymbol} = ${formatNumber(pair.r, 3)}<br>${ciText}`;
     }));
     const heatmap = {
         type: 'heatmap',
@@ -945,11 +1106,10 @@ function renderCorrelationHeatmap(stats) {
         zmin: -1,
         zmax: 1,
         colorbar: {
-            title: 'r',
+            title: coefficientSymbol,
             titleside: 'right'
         },
         text,
-        texttemplate: '%{text}',
         hoverinfo: 'text',
         hovertext: hoverTexts
     };
@@ -961,9 +1121,26 @@ function renderCorrelationHeatmap(stats) {
         plot_bgcolor: 'rgba(0,0,0,0)',
         height: 420
     };
+    const annotations = [];
+    variables.forEach((yName, row) => {
+        variables.forEach((xName, col) => {
+            if (row > col) {
+                annotations.push({
+                    x: xName,
+                    y: yName,
+                    text: formatNumber(stats.correlations[row][col], 2),
+                    showarrow: false,
+                    font: { color: '#1f2a37', size: 12 },
+                    bgcolor: 'rgba(255,255,255,0.4)',
+                    borderpad: 2
+                });
+            }
+        });
+    });
+    layout.annotations = annotations;
     Plotly.react(container, [heatmap], layout, { responsive: true, displayModeBar: false });
     if (note) {
-        note.textContent = 'Lower-left cells display correlation coefficients; hover to see exact values with confidence intervals.';
+        note.textContent = `${describeCorrelationMethod(method)} values populate the heatmap; hover any lower-left cell for exact coefficients and confidence intervals.`;
     }
 }
 
@@ -1004,6 +1181,9 @@ function updateNarratives(stats, data) {
         managerial.textContent = 'Summary will appear after analysis.';
         return;
     }
+    const method = stats.method || selectedCorrelationMethod;
+    const methodLabel = describeCorrelationMethod(method);
+    const coefficientSymbol = getCoefficientSymbol(method);
     if (data && data.mode === InputModes.MATRIX) {
         if (!Array.isArray(stats.pairStats) || !stats.pairStats.length) {
             apa.textContent = 'Upload multi-column data to summarize correlations.';
@@ -1017,15 +1197,15 @@ function updateNarratives(stats, data) {
             const ciText = isFinite(pair.ciLower) && isFinite(pair.ciUpper)
                 ? `CI [${formatNumber(pair.ciLower)}, ${formatNumber(pair.ciUpper)}]`
                 : 'CI unavailable';
-            return `${pair.yName} vs ${pair.xName} (r = ${formatNumber(pair.r, 3)}, ${ciText})`;
+            return `${pair.yName} vs ${pair.xName} (${coefficientSymbol} = ${formatNumber(pair.r, 3)}, ${ciText})`;
         };
         if (significantPairs.length) {
             const strongest = significantPairs.slice(0, Math.min(3, significantPairs.length));
-            apa.textContent = `A correlation matrix across ${stats.variables.length} variables (n = ${stats.n}) yielded ${significantPairs.length} significant pairwise relationships at α = ${stats.alpha}. Strongest effects: ${strongest.map(describePair).join('; ')}.`;
+            apa.textContent = `${methodLabel} matrix across ${stats.variables.length} variables (n = ${stats.n}) yielded ${significantPairs.length} significant pairwise relationships at alpha = ${stats.alpha}. Strongest effects: ${strongest.map(describePair).join('; ')}.`;
             const strengths = strongest.map(pair => `${pair.yName} vs ${pair.xName}`);
             managerial.textContent = `Significant links suggest shared drivers across the funnel. Prioritize the strongest pairs (${strengths.join(', ')}) when coordinating planning, and monitor the heatmap for emerging dependencies.`;
         } else {
-            apa.textContent = `A correlation matrix across ${stats.variables.length} variables (n = ${stats.n}) did not produce significant pairwise relationships at α = ${stats.alpha}.`;
+            apa.textContent = `${methodLabel} matrix across ${stats.variables.length} variables (n = ${stats.n}) did not produce significant pairwise relationships at alpha = ${stats.alpha}.`;
             managerial.textContent = 'Treat observed relationships as directional; expand the dataset or use targeted experiments before reallocating resources.';
         }
         return;
@@ -1034,9 +1214,8 @@ function updateNarratives(stats, data) {
     const pText = formatPValue(stats.pValue);
     const ciText = `${Math.round((1 - stats.alpha) * 100)}% CI [${formatNumber(stats.ciLower)}, ${formatNumber(stats.ciUpper)}]`;
     const dfLabel = `${stats.df}`;
-    const apaSentence = `A Pearson correlation found ${stats.r > 0 ? 'a positive' : stats.r < 0 ? 'a negative' : 'no linear'} relationship, r(${dfLabel}) = ${formatNumber(stats.r, 3)}, t(${dfLabel}) = ${formatNumber(stats.tStatistic, 3)}, ${pText}, ${ciText}.`;
+    const apaSentence = `${methodLabel} found ${stats.r > 0 ? 'a positive' : stats.r < 0 ? 'a negative' : 'no monotonic'} relationship, ${coefficientSymbol}(${dfLabel}) = ${formatNumber(stats.r, 3)}, t(${dfLabel}) = ${formatNumber(stats.tStatistic, 3)}, ${pText}, ${ciText}.`;
     apa.textContent = apaSentence;
-
     const strength = Math.abs(stats.r);
     let descriptor = 'a weak';
     if (strength >= 0.7) {
@@ -1060,7 +1239,7 @@ function updateDiagnostics(stats, data) {
     const container = document.getElementById('diagnostics-content');
     if (!container) return;
     if (data && data.mode === InputModes.MATRIX) {
-        container.innerHTML = '<p>For matrix uploads, review the heatmap and per-pair confidence intervals to diagnose multicollinearity or weak relationships. Pair-level diagnostics are available in single-correlation mode.</p>';
+        container.innerHTML = '<p>For matrix uploads, lean on the heatmap plus the pair-level confidence intervals; toggle the Pearson/Spearman selector above to see how each assumption shifts before interpreting any KPI pair.</p>';
         return;
     }
     if (!stats) {
@@ -1068,45 +1247,93 @@ function updateDiagnostics(stats, data) {
         return;
     }
     const diagnostics = [];
+    let recommendation = null;
+    const method = stats.method || selectedCorrelationMethod;
+    const methodLabel = describeCorrelationMethod(method);
+    const coefficientSymbol = getCoefficientSymbol(method);
+    const xValues = Array.isArray(data?.xValues) ? data.xValues : [];
+    const yValues = Array.isArray(data?.yValues) ? data.yValues : [];
+    const pearsonR = stats.pearsonR;
+    const spearmanR = stats.spearmanR;
     const n = stats.n;
+
     let sampleStatus = 'good';
-    let sampleMessage = 'Sample size comfortably supports the correlation test.';
+    let sampleMessage = `n = ${n} pairs keeps ${methodLabel.toLowerCase()} reasonably stable.`;
     if (n < 10) {
         sampleStatus = 'alert';
-        sampleMessage = 'Fewer than 10 pairs leaves the correlation very sensitive to single points. Add more observations if possible.';
+        sampleMessage = 'Fewer than 10 pairs leaves any correlation extremely sensitive to single points. Add more observations if possible.';
     } else if (n < 20) {
         sampleStatus = 'caution';
-        sampleMessage = 'Sample size is modest. Review the scatterplot for leverage points and document the limitation.';
+        sampleMessage = 'Sample size is modest. Document the limitation and lean on visuals to show how single points could sway the estimate.';
     }
     diagnostics.push({ title: 'Sample size', status: sampleStatus, message: sampleMessage });
 
+    let hasSpread = false;
     if (isFinite(stats.sdX) && stats.sdX > 0 && isFinite(stats.sdY) && stats.sdY > 0) {
+        hasSpread = true;
         diagnostics.push({
             title: 'Variable spread',
             status: 'good',
-            message: 'Both variables show usable variance, enabling a stable correlation estimate.'
+            message: 'Both variables show usable variance, so the correlation estimate is identifiable.'
         });
     } else {
         diagnostics.push({
             title: 'Variable spread',
             status: 'alert',
-            message: 'One variable has almost no spread. Correlation cannot be estimated reliably until both metrics vary.'
+            message: 'One variable has almost no spread. Neither Pearson nor Spearman can summarize constant metrics; collect additional variation.'
         });
     }
 
-    if (Array.isArray(data.xValues) && Array.isArray(data.yValues)) {
+    if (xValues.length >= 3 && yValues.length >= 3) {
+        const skewX = computeSkewness(xValues);
+        const skewY = computeSkewness(yValues);
+        if (isFinite(skewX) && isFinite(skewY)) {
+            const worstSkew = Math.max(Math.abs(skewX), Math.abs(skewY));
+            let skewStatus = 'good';
+            let skewMessage = `Skewness (${formatNumber(skewX, 2)}, ${formatNumber(skewY, 2)}) is within +/-1, supporting the mild-normality assumption.`;
+            if (worstSkew >= 1 && worstSkew < 2) {
+                skewStatus = 'caution';
+                skewMessage = `Skewness (${formatNumber(skewX, 2)}, ${formatNumber(skewY, 2)}) is noticeable. Consider reporting Spearman or transforming metrics before relying on Pearson intervals.`;
+            } else if (worstSkew >= 2) {
+                skewStatus = 'alert';
+                skewMessage = `Severe skew (${formatNumber(skewX, 2)}, ${formatNumber(skewY, 2)}) threatens parametric inferences. Prefer rank-based estimates or transform the data.`;
+            }
+            if (method === CorrelationMethods.SPEARMAN && worstSkew >= 1) {
+                skewMessage += ' Spearman already down-weights skew, but document why you chose it.';
+            }
+            diagnostics.push({ title: 'Skew / normality', status: skewStatus, message: skewMessage });
+            recommendation = recommendation || (worstSkew >= 1 ? CorrelationMethods.SPEARMAN : null);
+        } else {
+            diagnostics.push({
+                title: 'Skew / normality',
+                status: 'caution',
+                message: 'Unable to compute skewness because one metric lacks variation. Restore spread before trusting distributional assumptions.'
+            });
+        }
+    } else {
+        diagnostics.push({
+            title: 'Skew / normality',
+            status: 'caution',
+            message: 'Provide paired numeric data to evaluate skewness and justify Pearson vs. Spearman.'
+        });
+    }
+
+    if (xValues.length && yValues.length) {
         let outlierStatus = 'good';
-        let outlierMessage = 'No extreme z-scores detected in X or Y.';
+        let outlierMessage = 'No |z| > 3.5 detected in either metric.';
         if (isFinite(stats.sdX) && stats.sdX > 0 && isFinite(stats.sdY) && stats.sdY > 0) {
-            const hasOutliers = data.xValues.some(value => Math.abs((value - stats.meanX) / stats.sdX) > 3.5) ||
-                data.yValues.some(value => Math.abs((value - stats.meanY) / stats.sdY) > 3.5);
+            const hasOutliers = xValues.some(value => Math.abs((value - stats.meanX) / stats.sdX) > 3.5) ||
+                yValues.some(value => Math.abs((value - stats.meanY) / stats.sdY) > 3.5);
             if (hasOutliers) {
-                outlierStatus = 'alert';
-                outlierMessage = 'Observations with |z| greater than 3.5 detected. Inspect the scatterplot for leverage points.';
+                outlierStatus = method === CorrelationMethods.SPEARMAN ? 'caution' : 'alert';
+                outlierMessage = method === CorrelationMethods.SPEARMAN
+                    ? 'Extreme z-scores detected. Spearman is resilient, but inspect the scatterplot and note any trimming rules.'
+                    : 'Extreme z-scores detected. Pearson can swing dramatically; inspect the scatterplot or switch to Spearman.';
+                recommendation = recommendation || CorrelationMethods.SPEARMAN;
             }
         } else {
             outlierStatus = 'caution';
-            outlierMessage = 'Unable to compute z-scores. Ensure both variables have non-zero variance.';
+            outlierMessage = 'Unable to compute z-scores because one variable lacks spread.';
         }
         diagnostics.push({ title: 'Outliers/leverage', status: outlierStatus, message: outlierMessage });
     } else {
@@ -1117,14 +1344,62 @@ function updateDiagnostics(stats, data) {
         });
     }
 
-    diagnostics.push({
-        title: 'Linearity assumption',
-        status: stats.rSquared >= 0.09 ? 'good' : 'caution',
-        message: stats.rSquared >= 0.09
-            ? 'A sizable share of variance is explained, supporting a linear pattern.'
-            : 'Low R² suggests either a weak linear relationship or a non-linear pattern. Inspect the scatterplot.'
-    });
+    if (isFinite(pearsonR) && isFinite(spearmanR)) {
+        const diff = Math.abs(pearsonR - spearmanR);
+        let alignStatus = 'good';
+        let alignMessage = `Pearson r = ${formatNumber(pearsonR, 3)} and Spearman rho = ${formatNumber(spearmanR, 3)} (difference ${formatNumber(diff, 3)}). Either estimator tells a similar story.`;
+        if (diff >= 0.1 && diff < 0.2) {
+            alignStatus = 'caution';
+            alignMessage = `Pearson r = ${formatNumber(pearsonR, 3)} vs. Spearman rho = ${formatNumber(spearmanR, 3)} (difference ${formatNumber(diff, 3)}). Document why you favor ${methodLabel.toLowerCase()}.`;
+        } else if (diff >= 0.2) {
+            alignStatus = 'alert';
+            alignMessage = `Pearson r = ${formatNumber(pearsonR, 3)} vs. Spearman rho = ${formatNumber(spearmanR, 3)} diverge sharply (difference ${formatNumber(diff, 3)}). Inspect the scatterplot; method choice materially changes the conclusion.`;
+            recommendation = CorrelationMethods.SPEARMAN;
+        } else if (diff < 0.05 && recommendation !== CorrelationMethods.SPEARMAN) {
+            recommendation = CorrelationMethods.PEARSON;
+        }
+        diagnostics.push({ title: 'Method alignment', status: alignStatus, message: alignMessage });
+    }
 
+    const relationshipTitle = method === CorrelationMethods.SPEARMAN ? 'Monotonicity check' : 'Linearity check';
+    let relationshipStatus = 'good';
+    let relationshipMessage = '';
+    if (method === CorrelationMethods.SPEARMAN) {
+        const monotonic = Math.abs(stats.r);
+        if (monotonic < 0.15) {
+            relationshipStatus = 'alert';
+            relationshipMessage = `Rank correlation is very weak (${coefficientSymbol} = ${formatNumber(stats.r, 3)}). Confirm a monotonic pattern before leaning on Spearman.`;
+        } else if (monotonic < 0.3) {
+            relationshipStatus = 'caution';
+            relationshipMessage = `Rank correlation is modest (${coefficientSymbol} = ${formatNumber(stats.r, 3)}). Inspect the scatterplot for curvature or segmented relationships.`;
+        } else {
+            relationshipMessage = `Rank correlation (${coefficientSymbol} = ${formatNumber(stats.r, 3)}) indicates a clear monotonic trend.`;
+        }
+    } else {
+        const explained = Math.round(stats.rSquared * 100);
+        if (stats.rSquared < 0.05) {
+            relationshipStatus = 'caution';
+            relationshipMessage = `Linear fit explains only ${explained}% of the variance. Inspect for curvature or switch to Spearman if the relationship looks monotonic but curved.`;
+            recommendation = recommendation || CorrelationMethods.SPEARMAN;
+        } else {
+            relationshipMessage = `Linear fit explains about ${explained}% of the variance, supporting Pearson's linearity requirement.`;
+            recommendation = recommendation || CorrelationMethods.PEARSON;
+        }
+    }
+    diagnostics.push({ title: relationshipTitle, status: relationshipStatus, message: relationshipMessage });
+    if (!hasSpread) {
+        recommendation = null;
+    }
+    if (recommendation) {
+        const recommendedLabel = describeCorrelationMethod(recommendation, { short: true });
+        diagnostics.push({
+            title: 'Recommended estimator',
+            status: recommendation === CorrelationMethods.SPEARMAN ? 'caution' : 'good',
+            message: recommendation === CorrelationMethods.SPEARMAN
+                ? `Skew/outlier cues point toward ${recommendedLabel}. Switch the method toggle above or document why Pearson remains acceptable.`
+                : `${recommendedLabel} assumptions look satisfied. Stick with Pearson unless you need a rank-based story.`
+        });
+    }
     const items = diagnostics.map(item => `
         <div class="diagnostic-item ${item.status}">
             <strong>${escapeHtml(item.title)}</strong>
@@ -1176,7 +1451,7 @@ function updateResults() {
         return;
     }
     if (data.mode === InputModes.MATRIX) {
-        const matrixStats = computeMatrixCorrelations(data);
+        const matrixStats = computeMatrixCorrelations(data, { method: selectedCorrelationMethod });
         if (!matrixStats) {
             updateStatus('Unable to compute correlation matrix. Double-check your file.', true);
             clearVisuals();
@@ -1202,7 +1477,7 @@ function updateResults() {
         }
         return;
     }
-    const stats = computeCorrelationStats(data);
+    const stats = computeCorrelationStats(data, { method: selectedCorrelationMethod });
     if (!stats) {
         updateStatus('Unable to compute test statistics. Double-check your inputs.', true);
         clearVisuals();
@@ -1220,7 +1495,12 @@ function updateResults() {
         id: `${labels.x}__${labels.y}`,
         label: `${labels.y} vs ${labels.x}`,
         x: { name: labels.x, values: data.xValues || [] },
-        y: { name: labels.y, values: data.yValues || [] }
+        y: { name: labels.y, values: data.yValues || [] },
+        meta: {
+            alpha: stats.alpha,
+            method: stats.method,
+            n: stats.n
+        }
     }]);
     updateNarratives(stats, data);
     updateDiagnostics(stats, data);
@@ -1263,6 +1543,21 @@ function setupModeButtons() {
     document.querySelectorAll('.mode-button').forEach(button => {
         button.addEventListener('click', () => {
             switchMode(button.dataset.mode || InputModes.PAIRED);
+        });
+    });
+}
+
+function setupMethodControls() {
+    const radios = document.querySelectorAll('input[name="correlation-method"]');
+    if (!radios.length) return;
+    radios.forEach(radio => {
+        radio.checked = radio.value === selectedCorrelationMethod;
+        radio.addEventListener('change', () => {
+            if (!radio.checked) return;
+            selectedCorrelationMethod = radio.value === CorrelationMethods.SPEARMAN
+                ? CorrelationMethods.SPEARMAN
+                : CorrelationMethods.PEARSON;
+            updateResults();
         });
     });
 }
@@ -1751,6 +2046,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     setupManualControls();
     setupModeButtons();
+    setupMethodControls();
     setupAlphaControl();
     setupConfidenceButtons();
     setupDropzone();
