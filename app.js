@@ -4,21 +4,14 @@ let modifiedDate = new Date().toLocaleDateString();
 const InputModes = Object.freeze({
     MANUAL: 'manual',
     PAIRED: 'paired',
-    DIFFERENCE: 'difference',
-    SUMMARY: 'summary'
+    MATRIX: 'matrix'
 });
 
 const MODE_LABELS = {
     [InputModes.MANUAL]: 'Manual entry',
     [InputModes.PAIRED]: 'Paired upload',
-    [InputModes.DIFFERENCE]: 'Difference upload',
-    [InputModes.SUMMARY]: 'Summary stats'
+    [InputModes.MATRIX]: 'Correlation matrix upload'
 };
-
-const ManualStructures = Object.freeze({
-    PAIRED: 'paired',
-    DIFFERENCE: 'difference'
-});
 
 const DEFAULT_MANUAL_ROWS = 8;
 const MAX_MANUAL_ROWS = 50;
@@ -26,13 +19,14 @@ const MAX_UPLOAD_ROWS = 2000;
 
 let activeMode = InputModes.PAIRED;
 let selectedConfidenceLevel = 0.95;
-let manualStructure = ManualStructures.PAIRED;
 let manualRowCount = DEFAULT_MANUAL_ROWS;
 let scenarioManifest = [];
 let defaultScenarioDescription = '';
 let scenarioRawFile = '';
 let uploadedPairedData = null;
-let uploadedDifferenceData = null;
+let uploadedMatrixData = null;
+let scatterPairs = [];
+let activeScatterPair = null;
 
 // Utility helpers
 function clamp(value, min, max) {
@@ -213,10 +207,132 @@ function tCritical(probability, df) {
     return z + (z3 + z) / (4 * df) + (5 * z5 + 16 * z3 + 3 * z) / (96 * df * df);
 }
 
+function normInv(probability) {
+    if (probability <= 0 || probability >= 1) return NaN;
+    const a1 = -39.6968302866538;
+    const a2 = 220.946098424521;
+    const a3 = -275.928510446969;
+    const a4 = 138.357751867269;
+    const a5 = -30.6647980661472;
+    const a6 = 2.50662827745924;
+
+    const b1 = -54.4760987982241;
+    const b2 = 161.585836858041;
+    const b3 = -155.698979859887;
+    const b4 = 66.8013118877197;
+    const b5 = -13.2806815528857;
+
+    const c1 = -0.00778489400243029;
+    const c2 = -0.322396458041136;
+    const c3 = -2.40075827716184;
+    const c4 = -2.54973253934373;
+    const c5 = 4.37466414146497;
+    const c6 = 2.93816398269878;
+
+    const d1 = 0.00778469570904146;
+    const d2 = 0.32246712907004;
+    const d3 = 2.445134137143;
+    const d4 = 3.75440866190742;
+
+    const pLow = 0.02425;
+    const pHigh = 1 - pLow;
+    let q;
+    if (probability < pLow) {
+        q = Math.sqrt(-2 * Math.log(probability));
+        return (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
+            ((((d1 * q + d2) * q + d3) * q + d4) * q + 1);
+    }
+    if (probability <= pHigh) {
+        q = probability - 0.5;
+        const r = q * q;
+        return (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q /
+            (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1);
+    }
+    q = Math.sqrt(-2 * Math.log(1 - probability));
+    return -(((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
+        ((((d1 * q + d2) * q + d3) * q + d4) * q + 1);
+}
+
 function formatPValue(p) {
     if (!isFinite(p)) return 'p = --';
     if (p < 0.001) return 'p < .001';
     return `p = ${p.toFixed(3).replace(/^0/, '')}`;
+}
+
+function calculateCorrelationCoefficient(xValues, yValues) {
+    if (!Array.isArray(xValues) || !Array.isArray(yValues)) return NaN;
+    const n = Math.min(xValues.length, yValues.length);
+    if (!Number.isInteger(n) || n < 3) return NaN;
+    const meanX = mean(xValues);
+    const meanY = mean(yValues);
+    const sdX = standardDeviation(xValues);
+    const sdY = standardDeviation(yValues);
+    const denominator = sdX * sdY;
+    if (!denominator || !isFinite(denominator)) return NaN;
+    const numerator = xValues.reduce((sum, value, index) => {
+        const centeredX = value - meanX;
+        const centeredY = yValues[index] - meanY;
+        return sum + centeredX * centeredY;
+    }, 0);
+    return numerator / ((n - 1) * denominator);
+}
+
+function getScatterSelect() {
+    return document.getElementById('scatterpair-select');
+}
+
+function setScatterPairs(pairs = []) {
+    scatterPairs = Array.isArray(pairs) ? pairs : [];
+    const select = getScatterSelect();
+    if (!select) {
+        activeScatterPair = scatterPairs[0] || null;
+        renderScatterPlot(activeScatterPair);
+        return;
+    }
+    select.innerHTML = '';
+    if (!scatterPairs.length) {
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = 'No pairs available';
+        select.appendChild(option);
+        select.disabled = true;
+        activeScatterPair = null;
+        renderScatterPlot(null);
+        return;
+    }
+    scatterPairs.forEach((pair, index) => {
+        const option = document.createElement('option');
+        option.value = pair.id;
+        option.textContent = pair.label;
+        select.appendChild(option);
+        if (index === 0) {
+            select.value = pair.id;
+        }
+    });
+    select.disabled = scatterPairs.length === 1;
+    activeScatterPair = scatterPairs[0];
+    renderScatterPlot(activeScatterPair);
+}
+
+function handleScatterSelectChange() {
+    const select = getScatterSelect();
+    if (!select) return;
+    const pair = scatterPairs.find(item => item.id === select.value);
+    if (!pair) return;
+    activeScatterPair = pair;
+    renderScatterPlot(pair);
+}
+
+function toggleSingleOutputs(show) {
+    document.querySelectorAll('.single-only').forEach(element => {
+        element.classList.toggle('hidden', !show);
+    });
+}
+
+function toggleMatrixOutputs(show) {
+    document.querySelectorAll('.matrix-only').forEach(element => {
+        element.classList.toggle('hidden', !show);
+    });
 }
 
 function snapshotManualPairedValues() {
@@ -228,16 +344,6 @@ function snapshotManualPairedValues() {
         const before = beforeInput && beforeInput.value !== '' ? parseFloat(beforeInput.value) : NaN;
         const after = afterInput && afterInput.value !== '' ? parseFloat(afterInput.value) : NaN;
         return { before, after };
-    });
-}
-
-function snapshotManualDifferenceValues() {
-    const tbody = document.getElementById('difference-table-body');
-    if (!tbody) return [];
-    return Array.from(tbody.querySelectorAll('tr')).map(row => {
-        const valueInput = row.querySelector('.diff-value');
-        const diff = valueInput && valueInput.value !== '' ? parseFloat(valueInput.value) : NaN;
-        return { diff };
     });
 }
 
@@ -261,60 +367,19 @@ function renderPairedRows(existingValues = []) {
     }
 }
 
-function renderDifferenceRows(existingValues = []) {
-    const tbody = document.getElementById('difference-table-body');
-    if (!tbody) return;
-    tbody.innerHTML = '';
-    for (let i = 0; i < manualRowCount; i++) {
-        const diffValue = existingValues[i] && isFinite(existingValues[i].diff) ? existingValues[i].diff : '';
-        const row = document.createElement('tr');
-        row.innerHTML = `
-            <td><span class="row-number">${i + 1}</span></td>
-            <td><input type="number" class="diff-value" step="any" value="${diffValue !== '' ? diffValue : ''}"></td>
-        `;
-        row.querySelectorAll('input').forEach(input => {
-            input.addEventListener('input', () => updateResults());
-        });
-        tbody.appendChild(row);
-    }
-}
-
 function setManualRowCount(value, { preserveValues = true } = {}) {
     const parsed = Number.isInteger(value) ? value : parseInt(value, 10);
     const clamped = clamp(isFinite(parsed) ? parsed : DEFAULT_MANUAL_ROWS, 2, MAX_MANUAL_ROWS);
     const pairedValues = preserveValues ? snapshotManualPairedValues() : [];
-    const diffValues = preserveValues ? snapshotManualDifferenceValues() : [];
     manualRowCount = clamped;
     const input = document.getElementById('manual-row-count');
     if (input && parseInt(input.value, 10) !== clamped) {
         input.value = clamped;
     }
     renderPairedRows(pairedValues);
-    renderDifferenceRows(diffValues);
-}
-
-function toggleManualStructureViews() {
-    document.querySelectorAll('.manual-table').forEach(section => {
-        const isActive = section.dataset.structure === manualStructure;
-        section.classList.toggle('hidden', !isActive);
-    });
-    const select = document.getElementById('manual-entry-structure');
-    if (select) {
-        select.value = manualStructure;
-    }
 }
 
 function setupManualControls() {
-    const structureSelect = document.getElementById('manual-entry-structure');
-    if (structureSelect) {
-        structureSelect.addEventListener('change', () => {
-            manualStructure = structureSelect.value === ManualStructures.DIFFERENCE
-                ? ManualStructures.DIFFERENCE
-                : ManualStructures.PAIRED;
-            toggleManualStructureViews();
-            updateResults();
-        });
-    }
     const rowCountInput = document.getElementById('manual-row-count');
     if (rowCountInput) {
         rowCountInput.addEventListener('change', () => {
@@ -324,18 +389,16 @@ function setupManualControls() {
         });
     }
     setManualRowCount(manualRowCount, { preserveValues: false });
-    toggleManualStructureViews();
 }
 
 function collectPairedRows() {
     const rows = [];
     const beforeValues = [];
     const afterValues = [];
-    const differenceValues = [];
     const partialRows = [];
     const tbody = document.getElementById('paired-table-body');
     if (!tbody) {
-        return { rows, beforeValues, afterValues, differenceValues, partialRows };
+        return { rows, beforeValues, afterValues, partialRows };
     }
     tbody.querySelectorAll('tr').forEach((row, index) => {
         const beforeInput = row.querySelector('.paired-before');
@@ -345,41 +408,16 @@ function collectPairedRows() {
         const hasBefore = isFinite(before);
         const hasAfter = isFinite(after);
         if (hasBefore && hasAfter) {
-            const diff = after - before;
-            rows.push({ before, after, diff });
+            rows.push({ before, after });
             beforeValues.push(before);
             afterValues.push(after);
-            differenceValues.push(diff);
         } else if (hasBefore || hasAfter) {
             partialRows.push(`Row ${index + 1}`);
         }
     });
-    return { rows, beforeValues, afterValues, differenceValues, partialRows };
+    return { rows, beforeValues, afterValues, partialRows };
 }
 
-function collectDifferenceRows() {
-    const values = [];
-    const tbody = document.getElementById('difference-table-body');
-    if (!tbody) return values;
-    tbody.querySelectorAll('tr').forEach((row) => {
-        const valueInput = row.querySelector('.diff-value');
-        const diff = valueInput && valueInput.value !== '' ? parseFloat(valueInput.value) : NaN;
-        if (isFinite(diff)) {
-            values.push(diff);
-        }
-    });
-    return values;
-}
-
-function collectSummaryStats() {
-    const meanInput = document.getElementById('summary-mean');
-    const sdInput = document.getElementById('summary-sd');
-    const nInput = document.getElementById('summary-n');
-    const meanDiff = meanInput ? parseFloat(meanInput.value) : NaN;
-    const sdDiff = sdInput ? parseFloat(sdInput.value) : NaN;
-    const n = nInput ? parseInt(nInput.value, 10) : NaN;
-    return { meanDiff, sdDiff, n };
-}
 function gatherInput() {
     const alphaInput = document.getElementById('alpha');
     const alpha = alphaInput ? parseFloat(alphaInput.value) : 0.05;
@@ -388,50 +426,29 @@ function gatherInput() {
     }
 
     if (activeMode === InputModes.MANUAL) {
-        if (manualStructure === ManualStructures.PAIRED) {
-            const { beforeValues, afterValues, differenceValues, partialRows } = collectPairedRows();
-            if (partialRows.length) {
-                return { valid: false, message: `Complete both before and after values for ${partialRows.join(', ')}.` };
-            }
-            if (differenceValues.length < 2) {
-                return { valid: false, message: 'Provide at least two paired observations.' };
-            }
-            return {
-                valid: true,
-                data: {
-                    mode: InputModes.MANUAL,
-                    manualStructure,
-                    alpha,
-                    confidence: selectedConfidenceLevel,
-                    differences: differenceValues,
-                    beforeValues,
-                    afterValues,
-                    summaryOnly: false
-                }
-            };
+        const { beforeValues, afterValues, partialRows } = collectPairedRows();
+        if (partialRows.length) {
+            return { valid: false, message: `Complete both X and Y values for ${partialRows.join(', ')}.` };
         }
-        const diffs = collectDifferenceRows();
-        if (diffs.length < 2) {
-            return { valid: false, message: 'Enter at least two difference scores.' };
+        if (beforeValues.length < 3) {
+            return { valid: false, message: 'Provide at least three paired observations.' };
         }
         return {
             valid: true,
             data: {
                 mode: InputModes.MANUAL,
-                manualStructure,
                 alpha,
                 confidence: selectedConfidenceLevel,
-                differences: diffs,
-                beforeValues: [],
-                afterValues: [],
-                summaryOnly: false
+                xValues: beforeValues,
+                yValues: afterValues,
+                labels: { x: 'Variable X', y: 'Variable Y' }
             }
         };
     }
 
     if (activeMode === InputModes.PAIRED) {
-        if (!uploadedPairedData || !Array.isArray(uploadedPairedData.differences) || uploadedPairedData.differences.length < 2) {
-            return { valid: false, message: 'Upload at least two paired observations.' };
+        if (!uploadedPairedData || !Array.isArray(uploadedPairedData.xValues) || uploadedPairedData.xValues.length < 3) {
+            return { valid: false, message: 'Upload at least three paired observations.' };
         }
         return {
             valid: true,
@@ -439,53 +456,27 @@ function gatherInput() {
                 mode: InputModes.PAIRED,
                 alpha,
                 confidence: selectedConfidenceLevel,
-                differences: uploadedPairedData.differences,
-                beforeValues: uploadedPairedData.beforeValues,
-                afterValues: uploadedPairedData.afterValues,
-                summaryOnly: false
+                xValues: uploadedPairedData.xValues,
+                yValues: uploadedPairedData.yValues,
+                labels: {
+                    x: uploadedPairedData.xLabel || 'Variable X',
+                    y: uploadedPairedData.yLabel || 'Variable Y'
+                }
             }
         };
     }
 
-    if (activeMode === InputModes.DIFFERENCE) {
-        if (!uploadedDifferenceData || !Array.isArray(uploadedDifferenceData.differences) || uploadedDifferenceData.differences.length < 2) {
-            return { valid: false, message: 'Upload at least two difference scores.' };
+    if (activeMode === InputModes.MATRIX) {
+        if (!uploadedMatrixData || !Array.isArray(uploadedMatrixData.variables) || uploadedMatrixData.variables.length < 2) {
+            return { valid: false, message: 'Upload at least two named columns to build a correlation matrix.' };
         }
         return {
             valid: true,
             data: {
-                mode: InputModes.DIFFERENCE,
+                mode: InputModes.MATRIX,
                 alpha,
                 confidence: selectedConfidenceLevel,
-                differences: uploadedDifferenceData.differences,
-                beforeValues: [],
-                afterValues: [],
-                summaryOnly: false
-            }
-        };
-    }
-
-    if (activeMode === InputModes.SUMMARY) {
-        const stats = collectSummaryStats();
-        if (!isFinite(stats.meanDiff)) {
-            return { valid: false, message: 'Enter a numeric mean difference.' };
-        }
-        if (!isFinite(stats.sdDiff) || stats.sdDiff <= 0) {
-            return { valid: false, message: 'Standard deviation of differences must be positive.' };
-        }
-        if (!Number.isInteger(stats.n) || stats.n < 2) {
-            return { valid: false, message: 'Sample size must be at least 2.' };
-        }
-        return {
-            valid: true,
-            data: {
-                mode: InputModes.SUMMARY,
-                alpha,
-                confidence: selectedConfidenceLevel,
-                pairs: [],
-                differences: [],
-                summaryStats: stats,
-                summaryOnly: true
+                matrix: uploadedMatrixData
             }
         };
     }
@@ -493,65 +484,156 @@ function gatherInput() {
     return { valid: false, message: 'Unsupported mode.' };
 }
 
-function computePairedTest(data) {
+function computeCorrelationStats(data) {
     const alpha = clamp(data.alpha, 1e-6, 0.5);
-    let n;
-    let meanDiff;
-    let sdDiff;
-    if (data.summaryOnly && data.summaryStats) {
-        ({ n, meanDiff, sdDiff } = data.summaryStats);
-    } else {
-        const diffs = data.differences || [];
-        n = diffs.length;
-        meanDiff = mean(diffs);
-        sdDiff = standardDeviation(diffs);
-    }
-    if (!Number.isInteger(n) || n < 2) {
+    const xValues = data.xValues || [];
+    const yValues = data.yValues || [];
+    const n = Math.min(xValues.length, yValues.length);
+    if (!Number.isInteger(n) || n < 3) {
         return null;
     }
-    const df = n - 1;
-    const standardError = sdDiff / Math.sqrt(n);
-    const tStatistic = standardError > 0 ? meanDiff / standardError : NaN;
-    const pValue = isFinite(tStatistic) ? 2 * (1 - tCdf(Math.abs(tStatistic), df)) : NaN;
-    const ciCritical = tCritical(1 - alpha / 2, df);
-    const ciHalfWidth = ciCritical * standardError;
-    const ciLower = meanDiff - ciHalfWidth;
-    const ciUpper = meanDiff + ciHalfWidth;
-    const cohenDz = sdDiff > 0 ? meanDiff / sdDiff : NaN;
-    const hedgesG = isFinite(cohenDz) && df > 1 ? cohenDz * (1 - (3 / (4 * df - 1))) : cohenDz;
-
-    let beforeMean = NaN;
-    let afterMean = NaN;
-    if (data.beforeValues && data.afterValues && data.beforeValues.length > 0) {
-        beforeMean = mean(data.beforeValues);
-        afterMean = mean(data.afterValues);
+    const meanX = mean(xValues);
+    const meanY = mean(yValues);
+    const sdX = standardDeviation(xValues);
+    const sdY = standardDeviation(yValues);
+    const denominator = sdX * sdY;
+    if (!denominator || !isFinite(denominator)) {
+        return null;
     }
-
+    const numerator = xValues.reduce((sum, value, index) => {
+        const centeredX = value - meanX;
+        const centeredY = yValues[index] - meanY;
+        return sum + centeredX * centeredY;
+    }, 0);
+    const r = numerator / ((n - 1) * denominator);
+    const df = n - 2;
+    const rSquared = r * r;
+    const tStatistic = Math.sqrt((df) * rSquared / Math.max(1 - rSquared, 1e-12)) * Math.sign(r);
+    const pValue = isFinite(tStatistic) ? 2 * (1 - tCdf(Math.abs(tStatistic), df)) : NaN;
+    let ciLower = NaN;
+    let ciUpper = NaN;
+    let standardErrorZ = NaN;
+    if (n > 3) {
+        const safeR = clamp(r, -0.999999, 0.999999);
+        const fisherZ = 0.5 * Math.log((1 + safeR) / (1 - safeR));
+        standardErrorZ = 1 / Math.sqrt(n - 3);
+        const zCritical = normInv(1 - alpha / 2);
+        if (isFinite(zCritical)) {
+            const lowerZ = fisherZ - zCritical * standardErrorZ;
+            const upperZ = fisherZ + zCritical * standardErrorZ;
+            ciLower = Math.tanh(lowerZ);
+            ciUpper = Math.tanh(upperZ);
+        }
+    }
     return {
         n,
         df,
         alpha,
-        meanDiff,
-        sdDiff,
-        standardError,
+        r,
+        rSquared,
         tStatistic,
         pValue,
         ciLower,
         ciUpper,
         ciLevel: 1 - alpha,
-        cohenDz,
-        hedgesG,
-        beforeMean,
-        afterMean
+        meanX,
+        meanY,
+        sdX,
+        sdY,
+        standardErrorZ,
+        xLabel: data.labels?.x || 'Variable X',
+        yLabel: data.labels?.y || 'Variable Y'
     };
+}
+
+function computeMatrixCorrelations(data) {
+    if (!data || !data.matrix) return null;
+    const alpha = clamp(data.alpha, 1e-6, 0.5);
+    const matrix = data.matrix;
+    const variables = matrix.variables || [];
+    if (variables.length < 2) return null;
+    const columns = matrix.columns || {};
+    const n = matrix.rowCount || 0;
+    if (!Number.isInteger(n) || n < 3) return null;
+    const means = {};
+    const sds = {};
+    variables.forEach(name => {
+        const values = columns[name] || [];
+        means[name] = mean(values);
+        sds[name] = standardDeviation(values);
+    });
+    const correlations = variables.map(() => Array(variables.length).fill(NaN));
+    const pairStats = [];
+    const df = n - 2;
+    const zCritical = normInv(1 - alpha / 2);
+    for (let i = 0; i < variables.length; i++) {
+        correlations[i][i] = 1;
+        for (let j = i + 1; j < variables.length; j++) {
+            const valuesA = columns[variables[i]];
+            const valuesB = columns[variables[j]];
+            const r = calculateCorrelationCoefficient(valuesA, valuesB);
+            correlations[j][i] = r;
+            correlations[i][j] = r;
+            const safeR = clamp(r, -0.999999, 0.999999);
+            const tStatistic = isFinite(safeR)
+                ? Math.sqrt(df * safeR * safeR / Math.max(1 - safeR * safeR, 1e-12)) * Math.sign(safeR)
+                : NaN;
+            const pValue = isFinite(tStatistic) ? 2 * (1 - tCdf(Math.abs(tStatistic), df)) : NaN;
+            let ciLower = NaN;
+            let ciUpper = NaN;
+            if (n > 3 && isFinite(safeR) && Math.abs(safeR) < 1 && isFinite(zCritical)) {
+                const fisherZ = 0.5 * Math.log((1 + safeR) / (1 - safeR));
+                const se = 1 / Math.sqrt(n - 3);
+                ciLower = Math.tanh(fisherZ - zCritical * se);
+                ciUpper = Math.tanh(fisherZ + zCritical * se);
+            }
+            pairStats.push({
+                xName: variables[i],
+                yName: variables[j],
+                r,
+                ciLower,
+                ciUpper,
+                pValue,
+                tStatistic,
+                n
+            });
+        }
+    }
+    return {
+        alpha,
+        n,
+        variables,
+        means,
+        sds,
+        correlations,
+        columns,
+        pairStats
+    };
+}
+
+function buildMatrixScatterPairs(stats) {
+    if (!stats || !Array.isArray(stats.variables)) return [];
+    const pairs = [];
+    for (let i = 0; i < stats.variables.length; i++) {
+        for (let j = i + 1; j < stats.variables.length; j++) {
+            const xName = stats.variables[i];
+            const yName = stats.variables[j];
+            const xValues = stats.columns[xName] || [];
+            const yValues = stats.columns[yName] || [];
+            pairs.push({
+                id: `${xName}__${yName}`,
+                label: `${yName} vs ${xName}`,
+                x: { name: xName, values: xValues },
+                y: { name: yName, values: yValues }
+            });
+        }
+    }
+    return pairs;
 }
 
 function describeModeLabel(data) {
     if (data && data.mode === InputModes.MANUAL) {
-        const detail = data.manualStructure === ManualStructures.DIFFERENCE
-            ? 'differences'
-            : 'paired values';
-        return `${MODE_LABELS[InputModes.MANUAL]} (${detail})`;
+        return `${MODE_LABELS[InputModes.MANUAL]} (paired values)`;
     }
     if (data && data.mode && MODE_LABELS[data.mode]) {
         return MODE_LABELS[data.mode];
@@ -573,23 +655,31 @@ function updateResultCards(stats, data) {
     const modeSummary = document.getElementById('mode-summary');
 
     if (!stats) {
-        testStat.textContent = 't(--)=--';
+        testStat.textContent = 'r = --';
         pValue.textContent = 'p = --';
         ciSummary.textContent = 'CI: [--, --]';
-        effectSize.textContent = 'Cohen\'s dz = --';
-        hedges.textContent = 'Hedges\' g = --';
-        meanDiff.textContent = 'Mean difference = --';
-        sampleSummary.textContent = 'n = -- pairs';
-        modeSummary.textContent = `Mode: ${describeModeLabel({ mode: activeMode, manualStructure })}`;
+        effectSize.textContent = 't(--)=--';
+        hedges.textContent = 'R² = --';
+        meanDiff.textContent = 'Means: --';
+        if (data && data.mode === InputModes.MATRIX && data.matrix && Number.isInteger(data.matrix.rowCount)) {
+            sampleSummary.textContent = `n = ${data.matrix.rowCount} rows`;
+        } else {
+            sampleSummary.textContent = 'n = -- pairs';
+        }
+        modeSummary.textContent = `Mode: ${describeModeLabel({ mode: activeMode })}`;
         return;
     }
 
-    testStat.textContent = `t(${stats.df}) = ${formatNumber(stats.tStatistic, 3)}`;
+    testStat.textContent = `r = ${formatNumber(stats.r, 3)}`;
     pValue.textContent = formatPValue(stats.pValue);
     ciSummary.textContent = `${Math.round((1 - stats.alpha) * 100)}% CI: [${formatNumber(stats.ciLower)}, ${formatNumber(stats.ciUpper)}]`;
-    effectSize.textContent = `Cohen's dz = ${formatNumber(stats.cohenDz, 3)}`;
-    hedges.textContent = `Hedges' g = ${formatNumber(stats.hedgesG, 3)}`;
-    meanDiff.textContent = `Mean difference = ${formatNumber(stats.meanDiff, 3)}`;
+    effectSize.textContent = `t(${stats.df}) = ${formatNumber(stats.tStatistic, 3)}`;
+    hedges.textContent = `R² = ${formatNumber(stats.rSquared, 3)}`;
+    if (isFinite(stats.meanX) && isFinite(stats.meanY)) {
+        meanDiff.textContent = `Means: x̄ = ${formatNumber(stats.meanX)}, ȳ = ${formatNumber(stats.meanY)}`;
+    } else {
+        meanDiff.textContent = 'Means: --';
+    }
     sampleSummary.textContent = `n = ${stats.n} pairs`;
     modeSummary.textContent = `Mode: ${describeModeLabel(data)}`;
 }
@@ -602,13 +692,76 @@ function renderMeanDifferenceChart(stats) {
     if (!stats) {
         Plotly.purge(container);
         if (note) {
-            note.textContent = 'Provide data to summarize the mean difference and confidence interval.';
+            note.textContent = 'Provide data to summarize the correlation estimate and confidence interval.';
         }
         return;
     }
+    if (Array.isArray(stats.pairStats)) {
+        const pairs = stats.pairStats;
+        if (!pairs.length) {
+            Plotly.purge(container);
+            if (note) {
+                note.textContent = 'Upload multi-column data to summarize confidence intervals.';
+            }
+            return;
+        }
+        const yLabels = pairs.map(pair => `${pair.yName} vs ${pair.xName}`);
+        const xValues = pairs.map(pair => pair.r);
+        const errorPlus = pairs.map(pair => isFinite(pair.ciUpper) ? pair.ciUpper - pair.r : 0);
+        const errorMinus = pairs.map(pair => isFinite(pair.ciLower) ? pair.r - pair.ciLower : 0);
+        const trace = {
+            x: xValues,
+            y: yLabels,
+            type: 'scatter',
+            mode: 'markers',
+            marker: {
+                color: 'rgba(42, 125, 225, 0.9)',
+                size: 10,
+                line: { color: '#fff', width: 1 }
+            },
+            error_x: {
+                type: 'data',
+                symmetric: false,
+                array: errorPlus,
+                arrayminus: errorMinus,
+                color: '#1f2a37',
+                thickness: 1.5
+            },
+            hovertemplate: 'r = %{x:.3f}<br>%{y}<extra></extra>'
+        };
+        const layout = {
+            margin: { l: 120, r: 40, t: 30, b: 50 },
+            xaxis: {
+                zeroline: true,
+                zerolinecolor: '#c6d0e0',
+                title: 'Correlation (r)',
+                range: [-1, 1],
+                gridcolor: '#eef2fb'
+            },
+            yaxis: {
+                automargin: true
+            },
+            paper_bgcolor: 'rgba(0,0,0,0)',
+            plot_bgcolor: 'rgba(0,0,0,0)',
+            height: Math.max(320, pairs.length * 28 + 120)
+        };
+        Plotly.react(container, [trace], layout, { responsive: true, displayModeBar: false });
+        if (note) {
+            const missing = pairs.filter(pair => !isFinite(pair.ciLower) || !isFinite(pair.ciUpper)).length;
+            const ciLabel = `${Math.round((1 - stats.alpha) * 100)}% CI`;
+            note.textContent = missing
+                ? `${ciLabel} shown for each variable pair (rows with n < 4 omit CI bars).`
+                : `${ciLabel} shown for every variable pair.`;
+        }
+        return;
+    }
+    const hasCI = isFinite(stats.ciLower) && isFinite(stats.ciUpper);
+    const hoverTemplate = hasCI
+        ? `r = ${formatNumber(stats.r, 3)}<br>${Math.round((1 - stats.alpha) * 100)}% CI: [${formatNumber(stats.ciLower)}, ${formatNumber(stats.ciUpper)}]<extra></extra>`
+        : `r = ${formatNumber(stats.r, 3)}<br>CI requires at least 4 pairs.<extra></extra>`;
     const trace = {
-        x: [stats.meanDiff],
-        y: ['Mean difference'],
+        x: [stats.r],
+        y: ['Correlation'],
         type: 'scatter',
         mode: 'markers',
         marker: {
@@ -616,22 +769,25 @@ function renderMeanDifferenceChart(stats) {
             size: 14,
             line: { color: '#fff', width: 2 }
         },
-        error_x: {
+        hovertemplate: hoverTemplate
+    };
+    if (hasCI) {
+        trace.error_x = {
             type: 'data',
-            symmetric: true,
-            array: [stats.meanDiff - stats.ciLower],
+            symmetric: false,
+            array: [stats.ciUpper - stats.r],
+            arrayminus: [stats.r - stats.ciLower],
             color: '#1f2a37',
             thickness: 2
-        },
-        hovertemplate: `Mean diff = ${formatNumber(stats.meanDiff, 3)}<br>${Math.round((1 - stats.alpha) * 100)}% CI: [${formatNumber(stats.ciLower)}, ${formatNumber(stats.ciUpper)}]<extra></extra>`
-    };
-
+        };
+    }
     const layout = {
         margin: { l: 80, r: 40, t: 20, b: 50 },
         xaxis: {
             zeroline: true,
             zerolinecolor: '#c6d0e0',
-            title: 'Difference (after - before)',
+            title: 'Correlation (r)',
+            range: [-1, 1],
             gridcolor: '#eef2fb'
         },
         yaxis: {
@@ -655,112 +811,258 @@ function renderMeanDifferenceChart(stats) {
     };
     Plotly.react(container, [trace], layout, { responsive: true, displayModeBar: false });
     if (note) {
-        const ciLabel = `${Math.round((1 - stats.alpha) * 100)}% CI`;
-        note.textContent = `Mean diff = ${formatNumber(stats.meanDiff, 3)}; ${ciLabel}: [${formatNumber(stats.ciLower)}, ${formatNumber(stats.ciUpper)}]`;
+        if (hasCI) {
+            const ciLabel = `${Math.round((1 - stats.alpha) * 100)}% CI`;
+            note.textContent = `r = ${formatNumber(stats.r, 3)}; ${ciLabel}: [${formatNumber(stats.ciLower)}, ${formatNumber(stats.ciUpper)}]`;
+        } else {
+            note.textContent = 'Need at least 4 paired observations to compute the Fisher z confidence interval.';
+        }
     }
 }
 
-function renderDifferenceChart(data) {
+function renderScatterPlot(pair) {
     const container = document.getElementById('difference-chart');
     const note = document.getElementById('difference-chart-note');
     if (!container || !note) return;
     if (!window.Plotly) return;
 
-    const diffs = Array.isArray(data.differences) ? data.differences : [];
-    if (!diffs.length) {
+    if (!pair || !Array.isArray(pair.x.values) || !Array.isArray(pair.y.values) || pair.x.values.length < 2 || pair.y.values.length < 2) {
         Plotly.purge(container);
-        note.textContent = data.summaryOnly
-            ? 'Add raw paired or difference data to visualize the distribution.'
-            : 'Enter at least two difference scores to view the histogram.';
+        note.textContent = 'Add paired raw data to explore the scatterplot.';
         return;
     }
-    if (diffs.length < 3) {
-        Plotly.purge(container);
-        note.textContent = 'Need at least three difference scores to summarize a distribution.';
-        return;
-    }
-    note.textContent = `Mean = ${formatNumber(mean(diffs))}, SD = ${formatNumber(standardDeviation(diffs))} (bars show % of total).`;
+    const xValues = pair.x.values;
+    const yValues = pair.y.values;
+    const slopeIntercept = (() => {
+        const r = calculateCorrelationCoefficient(xValues, yValues);
+        if (!isFinite(r)) return null;
+        const meanX = mean(xValues);
+        const meanY = mean(yValues);
+        const sdX = standardDeviation(xValues);
+        const sdY = standardDeviation(yValues);
+        if (!sdX || !isFinite(sdY) || !sdY) return null;
+        const slope = r * (sdY / sdX);
+        const intercept = meanY - slope * meanX;
+        return { slope, intercept, r };
+    })();
 
-    const trace = {
-        x: diffs,
-        type: 'histogram',
-        histnorm: 'percent',
+    const pointTrace = {
+        x: xValues,
+        y: yValues,
+        mode: 'markers',
+        type: 'scatter',
         marker: {
-            color: 'rgba(42, 125, 225, 0.4)',
-            line: { color: 'rgba(42, 125, 225, 0.8)', width: 1 }
+            color: 'rgba(42, 125, 225, 0.8)',
+            size: 9,
+            line: { color: '#fff', width: 1 }
         },
-        nbinsx: Math.min(30, Math.ceil(Math.sqrt(diffs.length))),
-        hovertemplate: 'Percent: %{y:.1f}%<br>Difference: %{x:.2f}<extra></extra>'
+        hovertemplate: `${pair.x.name} = %{x:.3f}<br>${pair.y.name} = %{y:.3f}<extra></extra>`
     };
+    const traces = [pointTrace];
+    if (slopeIntercept) {
+        const sortedX = [...xValues].sort((a, b) => a - b);
+        const minX = sortedX[0];
+        const maxX = sortedX[sortedX.length - 1];
+        const lineX = [minX, maxX];
+        const lineY = lineX.map(value => slopeIntercept.intercept + slopeIntercept.slope * value);
+        traces.push({
+            x: lineX,
+            y: lineY,
+            mode: 'lines',
+            line: { color: '#d64747', width: 2 },
+            hoverinfo: 'skip',
+            showlegend: false
+        });
+    }
 
     const layout = {
-        margin: { l: 60, r: 20, t: 20, b: 50 },
-        bargap: 0.05,
+        margin: { l: 60, r: 20, t: 40, b: 50 },
         xaxis: {
-            title: 'Difference (after - before)',
-            zeroline: true,
-            zerolinecolor: '#c6d0e0',
+            title: pair.x.name,
+            zeroline: false,
             gridcolor: '#eef2fb'
         },
         yaxis: {
-            title: 'Percent of observations',
+            title: pair.y.name,
             gridcolor: '#eef2fb'
         },
-        shapes: [{
-            type: 'line',
-            x0: 0,
-            x1: 0,
-            y0: 0,
-            y1: 1,
-            yref: 'paper',
-            line: {
-                color: '#d64747',
-                width: 2,
-                dash: 'dot'
-            }
-        }],
         paper_bgcolor: 'rgba(0,0,0,0)',
         plot_bgcolor: 'rgba(0,0,0,0)',
         height: 320
     };
 
-    Plotly.react(container, [trace], layout, { responsive: true, displayModeBar: false });
+    Plotly.react(container, traces, layout, { responsive: true, displayModeBar: false });
+    const rText = slopeIntercept && isFinite(slopeIntercept.r) ? ` (r = ${formatNumber(slopeIntercept.r, 3)})` : '';
+    note.textContent = `Points show paired observations for ${pair.y.name} vs ${pair.x.name}; line depicts the least-squares fit${rText}.`;
+}
+
+function renderCorrelationHeatmap(stats) {
+    const container = document.getElementById('matrix-heatmap');
+    const note = document.getElementById('matrix-heatmap-note');
+    if (!container || !window.Plotly) return;
+    if (!stats || !Array.isArray(stats.variables) || stats.variables.length < 2) {
+        Plotly.purge(container);
+        if (note) {
+            note.textContent = 'Upload multi-column data to view the correlation heatmap.';
+        }
+        return;
+    }
+    const variables = stats.variables;
+    const pairMap = new Map();
+    if (Array.isArray(stats.pairStats)) {
+        stats.pairStats.forEach(pair => {
+            pairMap.set(`${pair.xName}__${pair.yName}`, pair);
+            pairMap.set(`${pair.yName}__${pair.xName}`, pair);
+        });
+    }
+    const z = variables.map((_, row) => variables.map((_, col) => (row >= col ? stats.correlations[row][col] : null)));
+    const text = variables.map((_, row) => variables.map((_, col) => {
+        if (row === col) return '1.000';
+        if (row > col) return formatNumber(stats.correlations[row][col], 3);
+        return '';
+    }));
+    const hoverTexts = variables.map((yName, row) => variables.map((xName, col) => {
+        if (row < col) return '';
+        const pair = pairMap.get(`${xName}__${yName}`);
+        if (!pair) {
+            return `${yName} vs ${xName}<br>r = ${formatNumber(stats.correlations[row][col], 3)}<br>CI unavailable`;
+        }
+        const ciText = (isFinite(pair.ciLower) && isFinite(pair.ciUpper))
+            ? `${Math.round((1 - stats.alpha) * 100)}% CI: [${formatNumber(pair.ciLower)}, ${formatNumber(pair.ciUpper)}]`
+            : 'CI unavailable';
+        return `${yName} vs ${xName}<br>r = ${formatNumber(pair.r, 3)}<br>${ciText}`;
+    }));
+    const heatmap = {
+        type: 'heatmap',
+        z,
+        x: variables,
+        y: variables,
+        colorscale: [
+            [0, '#2d6f93'],
+            [0.5, '#f8f8f8'],
+            [1, '#c0392b']
+        ],
+        zmin: -1,
+        zmax: 1,
+        colorbar: {
+            title: 'r',
+            titleside: 'right'
+        },
+        text,
+        texttemplate: '%{text}',
+        hoverinfo: 'text',
+        hovertext: hoverTexts
+    };
+    const layout = {
+        margin: { l: 80, r: 20, t: 40, b: 40 },
+        xaxis: { side: 'top' },
+        yaxis: { autorange: 'reversed' },
+        paper_bgcolor: 'rgba(0,0,0,0)',
+        plot_bgcolor: 'rgba(0,0,0,0)',
+        height: 420
+    };
+    Plotly.react(container, [heatmap], layout, { responsive: true, displayModeBar: false });
+    if (note) {
+        note.textContent = 'Lower-left cells display correlation coefficients; hover to see exact values with confidence intervals.';
+    }
+}
+
+function renderVariableStatsTable(stats) {
+    const container = document.getElementById('variable-stats');
+    if (!container) return;
+    if (!stats || !Array.isArray(stats.variables) || !stats.variables.length) {
+        container.innerHTML = '<p>Upload multi-column data to see variable summaries.</p>';
+        return;
+    }
+    const rows = stats.variables.map(name => `
+        <tr>
+            <td>${escapeHtml(name)}</td>
+            <td>${formatNumber(stats.means[name])}</td>
+            <td>${formatNumber(stats.sds[name])}</td>
+        </tr>
+    `).join('');
+    container.innerHTML = `
+        <table class="variable-stats-table">
+            <thead>
+                <tr>
+                    <th>Variable</th>
+                    <th>Mean</th>
+                    <th>SD</th>
+                </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+        </table>
+    `;
 }
 
 function updateNarratives(stats, data) {
     const apa = document.getElementById('apa-report');
     const managerial = document.getElementById('managerial-report');
-    if (!stats || !apa || !managerial) {
-        if (apa) apa.textContent = 'Summary will appear after analysis.';
-        if (managerial) managerial.textContent = 'Summary will appear after analysis.';
+    if (!apa || !managerial) return;
+    if (!stats) {
+        apa.textContent = 'Summary will appear after analysis.';
+        managerial.textContent = 'Summary will appear after analysis.';
+        return;
+    }
+    if (data && data.mode === InputModes.MATRIX) {
+        if (!Array.isArray(stats.pairStats) || !stats.pairStats.length) {
+            apa.textContent = 'Upload multi-column data to summarize correlations.';
+            managerial.textContent = 'Upload multi-column data to receive managerial guidance.';
+            return;
+        }
+        const significantPairs = stats.pairStats
+            .filter(pair => isFinite(pair.r) && isFinite(pair.pValue) && pair.pValue < stats.alpha)
+            .sort((a, b) => Math.abs(b.r) - Math.abs(a.r));
+        const describePair = (pair) => {
+            const ciText = isFinite(pair.ciLower) && isFinite(pair.ciUpper)
+                ? `CI [${formatNumber(pair.ciLower)}, ${formatNumber(pair.ciUpper)}]`
+                : 'CI unavailable';
+            return `${pair.yName} vs ${pair.xName} (r = ${formatNumber(pair.r, 3)}, ${ciText})`;
+        };
+        if (significantPairs.length) {
+            const strongest = significantPairs.slice(0, Math.min(3, significantPairs.length));
+            apa.textContent = `A correlation matrix across ${stats.variables.length} variables (n = ${stats.n}) yielded ${significantPairs.length} significant pairwise relationships at α = ${stats.alpha}. Strongest effects: ${strongest.map(describePair).join('; ')}.`;
+            const strengths = strongest.map(pair => `${pair.yName} vs ${pair.xName}`);
+            managerial.textContent = `Significant links suggest shared drivers across the funnel. Prioritize the strongest pairs (${strengths.join(', ')}) when coordinating planning, and monitor the heatmap for emerging dependencies.`;
+        } else {
+            apa.textContent = `A correlation matrix across ${stats.variables.length} variables (n = ${stats.n}) did not produce significant pairwise relationships at α = ${stats.alpha}.`;
+            managerial.textContent = 'Treat observed relationships as directional; expand the dataset or use targeted experiments before reallocating resources.';
+        }
         return;
     }
 
     const pText = formatPValue(stats.pValue);
     const ciText = `${Math.round((1 - stats.alpha) * 100)}% CI [${formatNumber(stats.ciLower)}, ${formatNumber(stats.ciUpper)}]`;
-    let apaSentence = `A paired-samples t-test indicated that the mean difference (${formatNumber(stats.meanDiff)}) `;
-    apaSentence += stats.pValue < stats.alpha
-        ? `was statistically significant, t(${stats.df}) = ${formatNumber(stats.tStatistic, 3)}, ${pText}, ${ciText}.`
-        : `did not differ significantly from zero, t(${stats.df}) = ${formatNumber(stats.tStatistic, 3)}, ${pText}, ${ciText}.`;
-    if (isFinite(stats.beforeMean) && isFinite(stats.afterMean)) {
-        apaSentence += ` The before mean was ${formatNumber(stats.beforeMean, 3)} and the after mean was ${formatNumber(stats.afterMean, 3)}.`;
-    }
+    const dfLabel = `${stats.df}`;
+    const apaSentence = `A Pearson correlation found ${stats.r > 0 ? 'a positive' : stats.r < 0 ? 'a negative' : 'no linear'} relationship, r(${dfLabel}) = ${formatNumber(stats.r, 3)}, t(${dfLabel}) = ${formatNumber(stats.tStatistic, 3)}, ${pText}, ${ciText}.`;
     apa.textContent = apaSentence;
 
-    const liftDescription = stats.meanDiff > 0
-        ? 'an increase relative to baseline'
-        : stats.meanDiff < 0
-            ? 'a decrease relative to baseline'
-            : 'no directional change';
+    const strength = Math.abs(stats.r);
+    let descriptor = 'a weak';
+    if (strength >= 0.7) {
+        descriptor = 'a very strong';
+    } else if (strength >= 0.5) {
+        descriptor = 'a strong';
+    } else if (strength >= 0.3) {
+        descriptor = 'a moderate';
+    } else if (strength >= 0.15) {
+        descriptor = 'a modest';
+    }
+    const direction = stats.r > 0 ? 'positive' : stats.r < 0 ? 'negative' : 'neutral';
+    const varianceExplained = isFinite(stats.rSquared) ? `${Math.round(stats.rSquared * 100)}% of the variance` : 'a portion of the variance';
     const decisionCue = stats.pValue < stats.alpha
-        ? 'Treat the shift as a reliable lift and prioritize rollout or scaling decisions accordingly.'
-        : 'Treat the observed shift as directional only; gather more data or pair the test with qualitative signals before reallocating budget.';
-    managerial.textContent = `The average paired difference of ${formatNumber(stats.meanDiff)} suggests ${liftDescription}. ${decisionCue}`;
+        ? `Because the correlation is statistically significant, treat ${descriptor} ${direction} relationship seriously in your planning.`
+        : `Because the correlation is not statistically significant, treat the ${direction} pattern as directional until you collect more data.`;
+    managerial.textContent = `The data suggest ${descriptor} ${direction} relationship where roughly ${varianceExplained} in Y aligns with X. ${decisionCue}`;
 }
 
 function updateDiagnostics(stats, data) {
     const container = document.getElementById('diagnostics-content');
     if (!container) return;
+    if (data && data.mode === InputModes.MATRIX) {
+        container.innerHTML = '<p>For matrix uploads, review the heatmap and per-pair confidence intervals to diagnose multicollinearity or weak relationships. Pair-level diagnostics are available in single-correlation mode.</p>';
+        return;
+    }
     if (!stats) {
         container.innerHTML = '<p>Provide data to review assumption checks.</p>';
         return;
@@ -768,54 +1070,59 @@ function updateDiagnostics(stats, data) {
     const diagnostics = [];
     const n = stats.n;
     let sampleStatus = 'good';
-    let sampleMessage = 'Sample size comfortably supports the paired t-test.';
+    let sampleMessage = 'Sample size comfortably supports the correlation test.';
     if (n < 10) {
         sampleStatus = 'alert';
-        sampleMessage = 'Fewer than 10 pairs leaves the test sensitive to outliers. Treat conclusions cautiously or add more observations.';
+        sampleMessage = 'Fewer than 10 pairs leaves the correlation very sensitive to single points. Add more observations if possible.';
     } else if (n < 20) {
         sampleStatus = 'caution';
-        sampleMessage = 'Sample size is modest. Review the histogram of differences and document the limitation.';
+        sampleMessage = 'Sample size is modest. Review the scatterplot for leverage points and document the limitation.';
     }
     diagnostics.push({ title: 'Sample size', status: sampleStatus, message: sampleMessage });
 
-    if (!data.summaryOnly && Array.isArray(data.differences) && data.differences.length >= 3) {
-        const diffs = data.differences;
-        const sd = standardDeviation(diffs);
-        const m = mean(diffs);
-        const skewNumerator = diffs.reduce((sum, diff) => sum + Math.pow(diff - m, 3), 0);
-        const skew = sd > 0 ? skewNumerator / (diffs.length * Math.pow(sd, 3)) : 0;
-        let skewStatus = 'good';
-        let skewMessage = 'Difference scores are roughly symmetric.';
-        if (Math.abs(skew) > 1) {
-            skewStatus = 'alert';
-            skewMessage = 'Differences appear heavily skewed. Consider a non-parametric alternative or transform the metric.';
-        } else if (Math.abs(skew) > 0.5) {
-            skewStatus = 'caution';
-            skewMessage = 'Moderate skew detected. Inspect the histogram for influential cases.';
-        }
-        diagnostics.push({ title: 'Shape of differences', status: skewStatus, message: skewMessage });
-
-        const maxDiff = Math.max(...diffs);
-        const minDiff = Math.min(...diffs);
-        let spreadStatus = 'good';
-        let spreadMessage = 'Difference spread looks reasonable.';
-        if (Math.abs(maxDiff - minDiff) > 6 * (sd || 1)) {
-            spreadStatus = 'alert';
-            spreadMessage = 'Very wide spread hints at outliers or inconsistent pairing. Audit the raw rows before acting.';
-        }
-        diagnostics.push({ title: 'Spread/outliers', status: spreadStatus, message: spreadMessage });
+    if (isFinite(stats.sdX) && stats.sdX > 0 && isFinite(stats.sdY) && stats.sdY > 0) {
+        diagnostics.push({
+            title: 'Variable spread',
+            status: 'good',
+            message: 'Both variables show usable variance, enabling a stable correlation estimate.'
+        });
     } else {
         diagnostics.push({
-            title: 'Shape of differences',
+            title: 'Variable spread',
+            status: 'alert',
+            message: 'One variable has almost no spread. Correlation cannot be estimated reliably until both metrics vary.'
+        });
+    }
+
+    if (Array.isArray(data.xValues) && Array.isArray(data.yValues)) {
+        let outlierStatus = 'good';
+        let outlierMessage = 'No extreme z-scores detected in X or Y.';
+        if (isFinite(stats.sdX) && stats.sdX > 0 && isFinite(stats.sdY) && stats.sdY > 0) {
+            const hasOutliers = data.xValues.some(value => Math.abs((value - stats.meanX) / stats.sdX) > 3.5) ||
+                data.yValues.some(value => Math.abs((value - stats.meanY) / stats.sdY) > 3.5);
+            if (hasOutliers) {
+                outlierStatus = 'alert';
+                outlierMessage = 'Observations with |z| greater than 3.5 detected. Inspect the scatterplot for leverage points.';
+            }
+        } else {
+            outlierStatus = 'caution';
+            outlierMessage = 'Unable to compute z-scores. Ensure both variables have non-zero variance.';
+        }
+        diagnostics.push({ title: 'Outliers/leverage', status: outlierStatus, message: outlierMessage });
+    } else {
+        diagnostics.push({
+            title: 'Outliers/leverage',
             status: 'caution',
-            message: 'Provide raw differences to visualize skewness and potential outliers.'
+            message: 'Provide raw paired data to screen for leverage points.'
         });
     }
 
     diagnostics.push({
-        title: 'Independence check',
-        status: 'good',
-        message: 'Pairs should come from the same units (e.g., customers, regions) while each pair remains independent from the next. Confirm the sampling plan upholds this.'
+        title: 'Linearity assumption',
+        status: stats.rSquared >= 0.09 ? 'good' : 'caution',
+        message: stats.rSquared >= 0.09
+            ? 'A sizable share of variance is explained, supporting a linear pattern.'
+            : 'Low R² suggests either a weak linear relationship or a non-linear pattern. Inspect the scatterplot.'
     });
 
     const items = diagnostics.map(item => `
@@ -838,16 +1145,23 @@ function clearVisuals() {
     if (window.Plotly) {
         Plotly.purge('mean-diff-chart');
         Plotly.purge('difference-chart');
+        Plotly.purge('matrix-heatmap');
     }
     const meanNote = document.getElementById('mean-diff-chart-note');
     if (meanNote) {
-        meanNote.textContent = 'Provide data to summarize the mean difference and confidence interval.';
+        meanNote.textContent = 'Provide data to summarize the correlation estimate and confidence interval.';
     }
     const diffNote = document.getElementById('difference-chart-note');
     if (diffNote) {
-        diffNote.textContent = '';
+        diffNote.textContent = 'Provide paired raw data to explore the scatterplot.';
     }
-    updateResultCards(null, { mode: activeMode, manualStructure });
+    setScatterPairs([]);
+    const matrixNote = document.getElementById('matrix-heatmap-note');
+    if (matrixNote) {
+        matrixNote.textContent = 'Upload multi-column data to view the correlation heatmap.';
+    }
+    renderVariableStatsTable(null);
+    updateResultCards(null, { mode: activeMode });
     updateNarratives(null, null);
     updateDiagnostics(null, null);
 }
@@ -857,18 +1171,57 @@ function updateResults() {
     if (!valid) {
         updateStatus(message, true);
         clearVisuals();
+        toggleMatrixOutputs(activeMode === InputModes.MATRIX);
+        toggleSingleOutputs(activeMode !== InputModes.MATRIX);
         return;
     }
-    const stats = computePairedTest(data);
+    if (data.mode === InputModes.MATRIX) {
+        const matrixStats = computeMatrixCorrelations(data);
+        if (!matrixStats) {
+            updateStatus('Unable to compute correlation matrix. Double-check your file.', true);
+            clearVisuals();
+            toggleMatrixOutputs(true);
+            toggleSingleOutputs(false);
+            return;
+        }
+        updateStatus('Matrix analysis complete. Explore the heatmap, intervals, and scatter dropdown below.');
+        toggleSingleOutputs(false);
+        toggleMatrixOutputs(true);
+        updateResultCards(null, data);
+        renderMeanDifferenceChart(matrixStats);
+        renderCorrelationHeatmap(matrixStats);
+        renderVariableStatsTable(matrixStats);
+        const pairs = buildMatrixScatterPairs(matrixStats);
+        setScatterPairs(pairs);
+        updateNarratives(matrixStats, data);
+        updateDiagnostics(null, { mode: InputModes.MATRIX });
+        modifiedDate = new Date().toLocaleDateString();
+        const modifiedLabel = document.getElementById('modified-date');
+        if (modifiedLabel) {
+            modifiedLabel.textContent = modifiedDate;
+        }
+        return;
+    }
+    const stats = computeCorrelationStats(data);
     if (!stats) {
         updateStatus('Unable to compute test statistics. Double-check your inputs.', true);
         clearVisuals();
+        toggleSingleOutputs(true);
+        toggleMatrixOutputs(false);
         return;
     }
     updateStatus('Analysis complete. Interpret the cards, charts, and diagnostics below.');
+    toggleSingleOutputs(true);
+    toggleMatrixOutputs(false);
     updateResultCards(stats, data);
     renderMeanDifferenceChart(stats);
-    renderDifferenceChart(data);
+    const labels = data.labels || { x: stats.xLabel || 'Variable X', y: stats.yLabel || 'Variable Y' };
+    setScatterPairs([{
+        id: `${labels.x}__${labels.y}`,
+        label: `${labels.y} vs ${labels.x}`,
+        x: { name: labels.x, values: data.xValues || [] },
+        y: { name: labels.y, values: data.yValues || [] }
+    }]);
     updateNarratives(stats, data);
     updateDiagnostics(stats, data);
     modifiedDate = new Date().toLocaleDateString();
@@ -890,14 +1243,14 @@ function switchMode(mode, { suppressUpdate = false } = {}) {
     });
     const importTools = document.getElementById('import-tools');
     if (importTools) {
-        importTools.classList.toggle('hidden', mode === InputModes.SUMMARY || mode === InputModes.MANUAL);
+        importTools.classList.toggle('hidden', mode === InputModes.MANUAL);
     }
     const instructions = document.getElementById('dropzone-instructions');
     if (instructions) {
-        if (mode === InputModes.PAIRED) {
-            instructions.textContent = 'Provide two named columns such as before,after (up to 2,000 rows). Each row becomes a matched pair.';
-        } else if (mode === InputModes.DIFFERENCE) {
-            instructions.textContent = 'Provide a single column named diff with up to 2,000 rows of observed differences.';
+        if (mode === InputModes.MATRIX) {
+            instructions.textContent = 'Provide two or more named columns (comma or tab separated). Each column becomes a variable in the correlation matrix.';
+        } else {
+            instructions.textContent = 'Provide two named columns (e.g., x,y). Each row becomes one paired observation.';
         }
     }
     refreshScenarioDownloadVisibility();
@@ -973,7 +1326,7 @@ function detectDelimiter(line) {
     return ',';
 }
 
-function parseDelimitedText(text, expectedColumns, { maxRows = MAX_UPLOAD_ROWS } = {}) {
+function parseDelimitedText(text, expectedColumns = null, { maxRows = MAX_UPLOAD_ROWS } = {}) {
     const trimmed = text.trim();
     if (!trimmed) {
         throw new Error('File is empty.');
@@ -984,8 +1337,11 @@ function parseDelimitedText(text, expectedColumns, { maxRows = MAX_UPLOAD_ROWS }
     }
     const delimiter = detectDelimiter(lines[0]);
     const headers = lines[0].split(delimiter).map(h => h.trim());
-    if (headers.length !== expectedColumns) {
+    if (expectedColumns !== null && headers.length !== expectedColumns) {
         throw new Error(`Expected ${expectedColumns} column(s) but found ${headers.length}.`);
+    }
+    if (expectedColumns === null && headers.length < 2) {
+        throw new Error('Provide at least two columns with headers.');
     }
     const rows = [];
     const errors = [];
@@ -1005,7 +1361,7 @@ function parseDelimitedText(text, expectedColumns, { maxRows = MAX_UPLOAD_ROWS }
         }
         rows.push(numericValues);
         if (rows.length > maxRows) {
-            throw new Error(`Upload limit exceeded: Only ${maxRows} row(s) are supported per file. Use a summary or split the dataset.`);
+            throw new Error(`Upload limit exceeded: Only ${maxRows} row(s) are supported per file. Split the dataset before re-uploading.`);
         }
     }
     if (!rows.length) {
@@ -1028,8 +1384,8 @@ function updateUploadStatus(mode, message, status = '') {
     let targetId = '';
     if (mode === InputModes.PAIRED) {
         targetId = 'paired-upload-status';
-    } else if (mode === InputModes.DIFFERENCE) {
-        targetId = 'difference-upload-status';
+    } else if (mode === InputModes.MATRIX) {
+        targetId = 'matrix-upload-status';
     }
     if (!targetId) return;
     const target = document.getElementById(targetId);
@@ -1045,9 +1401,10 @@ function importPairedData(text) {
     try {
         const { headers, rows, errors } = parseDelimitedText(text, 2, { maxRows: MAX_UPLOAD_ROWS });
         uploadedPairedData = {
-            beforeValues: rows.map(values => values[0]),
-            afterValues: rows.map(values => values[1]),
-            differences: rows.map(values => values[1] - values[0]),
+            xValues: rows.map(values => values[0]),
+            yValues: rows.map(values => values[1]),
+            xLabel: headers[0] || 'Variable X',
+            yLabel: headers[1] || 'Variable Y',
             rowCount: rows.length
         };
         const skippedNote = errors.length ? ` Skipped ${errors.length} row(s).` : '';
@@ -1063,21 +1420,40 @@ function importPairedData(text) {
     }
 }
 
-function importDifferenceData(text) {
+function importMatrixData(text) {
     try {
-        const { headers, rows, errors } = parseDelimitedText(text, 1, { maxRows: MAX_UPLOAD_ROWS });
-        uploadedDifferenceData = {
-            differences: rows.map(values => values[0]),
-            rowCount: rows.length
+        const { headers, rows, errors } = parseDelimitedText(text, null, { maxRows: MAX_UPLOAD_ROWS });
+        if (headers.length < 2) {
+            throw new Error('Matrix upload requires at least two columns.');
+        }
+        const seen = new Set();
+        const variableNames = headers.map((header, index) => {
+            const base = header || `Var ${index + 1}`;
+            let candidate = base;
+            let suffix = 2;
+            while (seen.has(candidate)) {
+                candidate = `${base}_${suffix++}`;
+            }
+            seen.add(candidate);
+            return candidate;
+        });
+        const columnStore = {};
+        variableNames.forEach((name, index) => {
+            columnStore[name] = rows.map(values => values[index]);
+        });
+        uploadedMatrixData = {
+            variables: variableNames,
+            columns: columnStore,
+            rowCount: rows.length,
+            errors
         };
         const skippedNote = errors.length ? ` Skipped ${errors.length} row(s).` : '';
-        const column = headers[0] || 'diff';
-        setFileFeedback(`Loaded ${rows.length} differences from column "${column}".${skippedNote}`, 'success');
-        updateUploadStatus(InputModes.DIFFERENCE, `${rows.length} difference(s) ready.${skippedNote}`, 'success');
+        setFileFeedback(`Loaded ${rows.length} rows across ${headers.length} variables.${skippedNote}`, 'success');
+        updateUploadStatus(InputModes.MATRIX, `${rows.length} row(s) ready with ${headers.length} columns.${skippedNote}`, 'success');
         updateResults();
     } catch (error) {
-        uploadedDifferenceData = null;
-        updateUploadStatus(InputModes.DIFFERENCE, error.message, 'error');
+        uploadedMatrixData = null;
+        updateUploadStatus(InputModes.MATRIX, error.message, 'error');
         setFileFeedback(error.message, 'error');
         throw error;
     }
@@ -1087,20 +1463,22 @@ function handleFile(file) {
     if (!file) return;
     const reader = new FileReader();
     reader.onload = event => {
-        if (activeMode === InputModes.PAIRED) {
-            try {
-                importPairedData(event.target.result);
-            } catch {
-                // Errors already surfaced via status text.
+        if (activeMode !== InputModes.PAIRED) {
+            if (activeMode === InputModes.MATRIX) {
+                try {
+                    importMatrixData(event.target.result);
+                } catch {
+                    // errors handled above
+                }
+            } else {
+                setFileFeedback('Switch to paired upload mode to import files.', 'error');
             }
-        } else if (activeMode === InputModes.DIFFERENCE) {
-            try {
-                importDifferenceData(event.target.result);
-            } catch {
-                // Errors already surfaced via status text.
-            }
-        } else {
-            setFileFeedback('Switch to a paired or difference upload mode to import files.', 'error');
+            return;
+        }
+        try {
+            importPairedData(event.target.result);
+        } catch {
+            // Errors already surfaced via status text.
         }
     };
     reader.onerror = () => setFileFeedback('Unable to read the file.', 'error');
@@ -1158,17 +1536,17 @@ function downloadTextFile(filename, content) {
 
 function setupTemplateDownloads() {
     const pairedButton = document.getElementById('download-paired-template');
-    const diffButton = document.getElementById('download-diff-template');
+    const matrixButton = document.getElementById('download-matrix-template');
     if (pairedButton) {
         pairedButton.addEventListener('click', () => {
-            const content = 'label,before,after\nSample 1,45,52\nSample 2,38,47\nSample 3,55,63\n';
-            downloadTextFile('paired_template.csv', content);
+            const content = 'label,x,y\nSample 1,4.2,5.1\nSample 2,3.7,4.9\nSample 3,5.0,6.4\n';
+            downloadTextFile('correlation_template.csv', content);
         });
     }
-    if (diffButton) {
-        diffButton.addEventListener('click', () => {
-            const content = 'diff\n7\n9\n-2\n4\n';
-            downloadTextFile('difference_template.csv', content);
+    if (matrixButton) {
+        matrixButton.addEventListener('click', () => {
+            const content = 'spend,signups,retention\n42,360,78\n50,395,81\n55,425,84\n60,452,87\n65,480,89\n';
+            downloadTextFile('correlation_matrix_template.csv', content);
         });
     }
 }
@@ -1242,16 +1620,12 @@ function parseScenarioText(text) {
         alpha: NaN,
         mode: '',
         pairedData: '',
-        differenceData: '',
-        summaryStats: '',
         rawFile: ''
     };
     let currentSection = '';
     const lines = text.split(/\r?\n/);
     const descriptionLines = [];
     const pairedLines = [];
-    const differenceLines = [];
-    let summaryLine = '';
     lines.forEach(line => {
         const trimmed = line.trim();
         if (!trimmed) {
@@ -1280,12 +1654,6 @@ function parseScenarioText(text) {
             case 'paired columns':
                 pairedLines.push(line);
                 break;
-            case 'difference column':
-                differenceLines.push(line);
-                break;
-            case 'summary stats':
-                summaryLine = trimmed;
-                break;
             case 'raw data file':
                 if (trimmed.startsWith('file=')) {
                     result.rawFile = trimmed.split('=').slice(1).join('=').trim();
@@ -1297,8 +1665,6 @@ function parseScenarioText(text) {
     });
     result.description = descriptionLines.join('\n').trim();
     result.pairedData = pairedLines.join('\n').trim();
-    result.differenceData = differenceLines.join('\n').trim();
-    result.summaryStats = summaryLine;
     return result;
 }
 
@@ -1306,19 +1672,9 @@ function applyScenarioData(parsed) {
     if (parsed.mode === 'paired' && parsed.pairedData) {
         switchMode(InputModes.PAIRED, { suppressUpdate: true });
         importPairedData(parsed.pairedData);
-    } else if (parsed.mode === 'difference' && parsed.differenceData) {
-        switchMode(InputModes.DIFFERENCE, { suppressUpdate: true });
-        importDifferenceData(parsed.differenceData);
-    } else if (parsed.mode === 'summary' && parsed.summaryStats) {
-        switchMode(InputModes.SUMMARY, { suppressUpdate: true });
-        const [meanStr, sdStr, nStr] = parsed.summaryStats.split('|').map(part => part.trim());
-        const meanInput = document.getElementById('summary-mean');
-        const sdInput = document.getElementById('summary-sd');
-        const nInput = document.getElementById('summary-n');
-        if (meanInput) meanInput.value = meanStr || '';
-        if (sdInput) sdInput.value = sdStr || '';
-        if (nInput) nInput.value = nStr || '';
-        updateResults();
+    } else if (parsed.mode === 'matrix' && parsed.pairedData) {
+        switchMode(InputModes.MATRIX, { suppressUpdate: true });
+        importMatrixData(parsed.pairedData);
     } else {
         updateResults();
     }
@@ -1401,6 +1757,11 @@ document.addEventListener('DOMContentLoaded', () => {
     setupTemplateDownloads();
     setupScenarioSelector();
     setupScenarioDownloadButton();
+    const scatterSelect = document.getElementById('scatterpair-select');
+    if (scatterSelect) {
+        scatterSelect.addEventListener('change', handleScatterSelectChange);
+    }
+    renderVariableStatsTable(null);
     switchMode(activeMode, { suppressUpdate: true });
     refreshScenarioDownloadVisibility();
 });

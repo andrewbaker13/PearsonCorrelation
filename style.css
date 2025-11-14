@@ -369,6 +369,43 @@ tbody input {
     margin-top: 0.5rem;
 }
 
+.scatter-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+}
+
+.scatter-controls label {
+    font-weight: 600;
+}
+
+.scatter-controls select {
+    flex: 1;
+}
+
+.matrix-only.hidden {
+    display: none;
+}
+
+.variable-stats-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 0.75rem;
+    font-size: 0.95rem;
+}
+
+.variable-stats-table th,
+.variable-stats-table td {
+    text-align: left;
+    padding: 0.35rem 0.25rem;
+    border-bottom: 1px solid var(--border);
+}
+
+.variable-stats-table tbody tr:last-child td {
+    border-bottom: none;
+}
+
 .narrative-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
